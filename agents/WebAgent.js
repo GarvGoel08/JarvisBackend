@@ -4,6 +4,7 @@ const { chromium } = require('playwright');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { callLangChain } = require('../services/langchain');
+const contentManager = require('../utils/contentManager');
 
 /**
  * A singular, general-purpose web agent that intelligently handles tasks
@@ -121,14 +122,17 @@ async function getComprehensiveDOM(page) {
         return el.tagName.toLowerCase();
       };
       
-      const elements = Array.from(document.querySelectorAll('a, button, input, textarea, select, h1, h2, h3, p, [role="button"]'));
+      // Get all interactive and content elements
+      const elements = Array.from(document.querySelectorAll('a, button, input, textarea, select, h1, h2, h3, p, [role="button"], form'));
       const relevantElements = elements.map((el, index) => {
         const rect = el.getBoundingClientRect();
-        const isVisible = rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== 'none' && window.getComputedStyle(el).visibility !== 'hidden';
+        const isVisible = rect.width > 0 && rect.height > 0 && 
+                         window.getComputedStyle(el).display !== 'none' && 
+                         window.getComputedStyle(el).visibility !== 'hidden';
         
         return {
           tag: el.tagName.toLowerCase(),
-          text: (el.textContent || el.value || el.placeholder || '').trim().slice(0, 100),
+          text: (el.textContent || el.value || el.placeholder || '').trim().slice(0, 150), // Slightly longer for better context
           selector: getSelector(el),
           id: el.id,
           name: el.name,
@@ -141,62 +145,95 @@ async function getComprehensiveDOM(page) {
         };
       });
 
-      return {
+      // Extract page content with better structure
+      const pageContent = {
         url: window.location.href,
         title: document.title,
-        text: document.body.innerText.slice(0, 5000),
-        elements: relevantElements.filter(el => el.isVisible),
+        bodyText: document.body.innerText.slice(0, 3000), // Reduced from 5000
+        elements: relevantElements.filter(el => el.isVisible && (el.text.length > 0 || el.tag === 'input' || el.tag === 'button')),
+        
+        // Add structured content for better analysis
+        headings: Array.from(document.querySelectorAll('h1, h2, h3')).map(h => ({
+          text: h.textContent.trim().slice(0, 100),
+          level: parseInt(h.tagName.charAt(1)),
+          selector: getSelector(h)
+        })).slice(0, 10), // Limit headings
+        
+        forms: Array.from(document.querySelectorAll('form')).map((form, i) => ({
+          action: form.action || '',
+          method: form.method || 'get',
+          selector: form.id ? `#${form.id}` : `form:nth-of-type(${i + 1})`,
+          inputCount: form.querySelectorAll('input, textarea, select').length
+        })).slice(0, 5), // Limit forms
+        
+        // Page metrics for context
+        metrics: {
+          elementCount: elements.length,
+          visibleCount: relevantElements.filter(el => el.isVisible).length,
+          interactiveCount: relevantElements.filter(el => 
+            el.isVisible && ['a', 'button', 'input', 'textarea', 'select'].includes(el.tag)
+          ).length
+        }
       };
+
+      return pageContent;
     });
-    return domData;
+    
+    // Use content manager to optimize the page data before returning
+    const optimizedData = contentManager.optimizePageData(domData, 'web_navigation');
+    
+    console.log(`[WebAgent] Extracted DOM: ${optimizedData.interactiveElements?.length || domData.elements?.length} elements (optimized: ${!!optimizedData.interactiveElements})`);
+    
+    return optimizedData.interactiveElements ? optimizedData : domData;
+    
   } catch (e) {
-    console.error(`Error extracting DOM: ${e.message}`);
-    return { url: page.url(), title: 'Error', text: '', elements: [] };
+    console.error(`[WebAgent] Error extracting DOM: ${e.message}`);
+    return { url: page.url(), title: 'Error', bodyText: '', elements: [], error: e.message };
   }
 }
 /**
  * Asks the LLM for the single next best action to take.
  */
 async function getNextAction(pageState, task, allSteps) {
-  const systemPrompt = `You are a web automation expert. Your goal is to navigate and interact with a website to complete a specific task.
-  You have access to a live snapshot of the page's DOM and a history of all previous actions.
-  
-  Instructions:
-  1. Analyze the 'Task', 'Page State', and 'Action History'.
-  2. Determine the single best action to take next to make progress.
-  3. If the task is completed, set "isCompleted" to true and provide the "finalAnswer".
-  4. If you are stuck or need to load more content, use a "scroll" action.
-  5. Your response MUST be a single JSON object.
-
-  Current Task: "${task}"
-
-  Page State (DOM):
-  ${JSON.stringify(pageState, null, 2)}
-
-  Action History (last 2 steps):
-  ${JSON.stringify(allSteps.slice(-2), null, 2)}
-  
-  Respond with JSON:
-  {
-    "action": {
-      "type": "click|fill|navigate|scroll|wait",
-      "target": "CSS_SELECTOR",
-      "value": "Optional value for fill/navigate/wait",
-      "reasoning": "Why this action was chosen."
-    },
-    "isCompleted": true|false,
-    "confidence": 0-1,
-    "finalAnswer": "Summary of the final result if completed, or an empty string."
-  }
-  
-  Example Actions:
-  - Fill a search box: { "type": "fill", "target": "input[name='q']", "value": "best phone", "reasoning": "Identified the search input by its name attribute." }
-  - Click a button: { "type": "click", "target": "button.search-button", "reasoning": "Found the search button with a specific class." }
-  - Scroll down: { "type": "scroll", "target": "body", "value": "500", "reasoning": "Scrolling to load more dynamic content on the page." }
-  `;
-
   try {
-    const response = await callLangChain(systemPrompt, 'What is the next action?');
+    // Create optimized prompt with task context
+    const promptData = {
+      task,
+      pageState,
+      actionHistory: allSteps.slice(-2) // Keep only last 2 steps to save tokens
+    };
+    
+    const systemPrompt = `You are a web automation expert. Analyze the page and determine the next action.
+    
+    RESPONSE FORMAT (JSON only):
+    {
+      "action": {
+        "type": "click|fill|navigate|scroll|wait",
+        "target": "CSS_SELECTOR",
+        "value": "Optional value for fill/navigate/wait",
+        "reasoning": "Why this action was chosen."
+      },
+      "isCompleted": true|false,
+      "confidence": 0-1,
+      "finalAnswer": "Result summary if completed, else empty string."
+    }`;
+    
+    const userPrompt = `Task: "${task}"
+    
+    Page Analysis:
+    - URL: ${pageState.url || 'Unknown'}
+    - Title: ${pageState.title || 'Unknown'}
+    - Interactive Elements: ${pageState.interactiveElements?.length || pageState.elements?.length || 0}
+    - Has Forms: ${pageState.forms?.length > 0 || false}
+    
+    Available Elements:
+    ${JSON.stringify(pageState.interactiveElements || pageState.elements || [], null, 2)}
+    
+    Recent Actions: ${allSteps.length > 0 ? JSON.stringify(allSteps.slice(-1), null, 2) : 'None'}
+    
+    Choose the best next action to progress toward the task goal.`;
+
+    const response = await callLangChain(systemPrompt, userPrompt, { task });
     const cleanedResponse = response.replace(/```json|```/g, '').trim();
     return JSON.parse(cleanedResponse);
   } catch (error) {

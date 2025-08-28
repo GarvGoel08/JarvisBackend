@@ -1,6 +1,7 @@
 const { ChatGoogleGenerativeAI } = require('@langchain/google-genai');
 const { HumanMessage, SystemMessage } = require('@langchain/core/messages');
 const { Ollama } = require('ollama');
+const contentManager = require('../utils/contentManager');
 require('dotenv').config();
 
 // Environment check
@@ -75,17 +76,30 @@ if (isDevelopment) {
 }
 
 /**
- * Calls AI model (Ollama in dev, Google Generative AI in prod) with round-robin API keys for production
+ * Calls AI model (Ollama in dev, Google Generative AI in prod) with automatic content optimization
  * @param {string} systemPrompt - The system message
  * @param {string} userPrompt - The user message
  * @param {Object} options - Additional options for the model
  * @returns {Promise<string>} - The AI response
  */
 async function callLangChain(systemPrompt, userPrompt, options = {}) {
+    // Prepare and optimize content before making the request
+    const preparedContent = contentManager.prepareForLLM(
+        systemPrompt, 
+        userPrompt, 
+        options.task || ''
+    );
+
+    // Log optimization info if content was modified
+    if (preparedContent.wasOptimized) {
+        console.log(`[LangChain] Content optimized: ${preparedContent.tokenInfo.totalTokens} tokens (stage: ${preparedContent.optimizationStage})`);
+    }
+
+    // Use optimized content for the actual call
     if (isDevelopment) {
-        return await callOllama(systemPrompt, userPrompt, options);
+        return await callOllama(preparedContent.systemPrompt, preparedContent.userContent, options);
     } else {
-        return await callGoogleAI(systemPrompt, userPrompt, options);
+        return await callGoogleAI(preparedContent.systemPrompt, preparedContent.userContent, options);
     }
 }
 
@@ -107,20 +121,30 @@ async function callOllama(systemPrompt, userPrompt, options = {}) {
 
         console.log(`🔧 [Dev] Calling Ollama with model: ${model}`);
         
+        // Get token configuration from environment
+        const maxTokens = options.maxOutputTokens || 
+                         parseInt(process.env.OLLAMA_MAX_TOKENS) || 
+                         1024;
+        const temperature = options.temperature || 
+                           parseFloat(process.env.OLLAMA_TEMPERATURE) || 
+                           0.3;
+        
         // For streaming responses, we'll collect the full response
         const response = await ollamaClient.chat({
             model: model,
             messages: messages,
             stream: false, // Set to false to get complete response at once
             options: {
-                temperature: options.temperature || 0.2,
+                temperature: temperature,
                 top_p: options.top_p || 0.9,
-                max_tokens: options.maxOutputTokens || 1024,
+                num_predict: maxTokens, // Ollama uses num_predict instead of max_tokens
+                num_ctx: parseInt(process.env.OLLAMA_CONTEXT_LENGTH) || 8192,
+                repeat_penalty: 1.1,
                 ...options
             }
         });
 
-        console.log(`✅ [Dev] Ollama response received successfully`);
+        console.log(`✅ [Dev] Ollama response received successfully (${maxTokens} max tokens)`);
         return response.message.content;
         
     } catch (error) {
