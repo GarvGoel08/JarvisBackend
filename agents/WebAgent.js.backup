@@ -1,0 +1,1633 @@
+const { chromium } = require('playwright');
+const { callLangChain } = require('../services/langchain');
+const axios = require('axios');
+const cheerio = require('cheerio');
+
+/**
+ * WebAgent - Handles web browsing, scraping, and automation tasks
+ * Supports both simple HTTP requests and complex browser automation
+ */
+
+/**
+ * Main WebAgent function
+ * @param {Object} params - Parameters for web operations
+ * @param {string} params.url - Target URL
+ * @param {string} params.task - Task description
+ * @param {string} params.method - 'scrape', 'browse', 'automate', 'interact'
+ * @param {Object} params.options - Additional options
+ * @param {Array} params.previousSteps - Previous steps taken
+ * @param {number} params.maxIterations - Maximum iterations (default: 5)
+ * @returns {Promise<Object>} - Response object
+ */
+async function WebAgent(params) {
+    try {
+        // Validate required parameters
+        if (!params.url || !params.task) {
+            throw new Error('Both url and task parameters are required');
+        }
+
+        const {
+            url,
+            task,
+            method = 'auto', // auto, scrape, browse, automate, interact
+            options = {},
+            previousSteps = [],
+            maxIterations = 5
+        } = params;
+
+        console.log(`[WebAgent] Starting task: "${task}" on ${url}`);
+        console.log(`[WebAgent] Method: ${method}, Max iterations: ${maxIterations}`);
+
+        // Initialize task state
+        let currentIteration = 0;
+        let taskCompleted = false;
+        let finalResult = null;
+        let allSteps = [...previousSteps];
+        let browser = null;
+        let page = null;
+
+        // Main task loop
+        while (!taskCompleted && currentIteration < maxIterations) {
+            currentIteration++;
+            console.log(`[WebAgent] Iteration ${currentIteration}/${maxIterations}`);
+
+            try {
+                // Determine the best approach for this iteration
+                const approach = await determineApproach(url, task, method, allSteps, currentIteration);
+                console.log(`[WebAgent] Using approach: ${approach.method}`);
+                
+                // Validate approach - ensure interaction only happens after inspection
+                if (approach.method === 'interact' && !hasValidPageInspection(allSteps)) {
+                    console.warn(`[WebAgent] Preventing interaction without page inspection, switching to browse`);
+                    approach.method = 'browse';
+                    approach.instructions = 'Navigate and inspect page structure before interaction';
+                    approach.reasoning = 'Safety check: must inspect page before interaction';
+                }
+
+                let stepResult;
+
+                switch (approach.method) {
+                    case 'scrape':
+                        stepResult = await performScraping(url, task, approach.instructions);
+                        break;
+                    
+                    case 'browse':
+                        if (!browser) {
+                            const browserData = await launchBrowser(options);
+                            browser = browserData.browser;
+                            page = await browserData.context.newPage();
+                        }
+                        stepResult = await performBrowsing(page, url, task, approach.instructions);
+                        break;
+                    
+                    case 'interact':
+                        if (!browser) {
+                            const browserData = await launchBrowser(options);
+                            browser = browserData.browser;
+                            page = await browserData.context.newPage();
+                        }
+                        stepResult = await performInteraction(page, url, task, approach.instructions, allSteps);
+                        break;
+                    
+                    case 'analyze':
+                        stepResult = await analyzeResults(allSteps, task);
+                        break;
+                    
+                    default:
+                        throw new Error(`Unknown method: ${approach.method}`);
+                }
+
+                // Add step to history
+                allSteps.push({
+                    iteration: currentIteration,
+                    method: approach.method,
+                    instructions: approach.instructions,
+                    result: stepResult,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Check if task is completed
+                const completionCheck = await checkTaskCompletion(task, allSteps, stepResult);
+                
+                if (completionCheck.isCompleted) {
+                    taskCompleted = true;
+                    finalResult = completionCheck.finalResult;
+                    console.log(`[WebAgent] Task completed after ${currentIteration} iterations`);
+                } else {
+                    console.log(`[WebAgent] Task not completed, continuing with next iteration`);
+                    console.log(`[WebAgent] Next step suggestion: ${completionCheck.nextStepSuggestion}`);
+                }
+
+            } catch (iterationError) {
+                console.error(`[WebAgent] Error in iteration ${currentIteration}:`, iterationError);
+                
+                // Add error to steps
+                allSteps.push({
+                    iteration: currentIteration,
+                    method: 'error',
+                    error: iterationError.message,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Decide whether to continue or stop based on error type
+                const shouldContinue = await handleIterationError(iterationError, currentIteration, maxIterations);
+                if (!shouldContinue) {
+                    break;
+                }
+            }
+        }
+
+        // Cleanup browser
+        if (browser) {
+            await browser.close();
+            console.log(`[WebAgent] Browser closed`);
+        }
+
+        // Prepare final response
+        if (!taskCompleted && currentIteration >= maxIterations) {
+            finalResult = await generatePartialResult(task, allSteps);
+        }
+
+        return {
+            isCompleted: taskCompleted,
+            result: finalResult,
+            totalIterations: currentIteration,
+            maxIterations: maxIterations,
+            allSteps: allSteps,
+            url: url,
+            task: task,
+            method: method,
+            timestamp: new Date().toISOString(),
+            agent: 'WebAgent'
+        };
+
+    } catch (error) {
+        console.error('[WebAgent] Fatal error:', error);
+        
+        return {
+            isCompleted: false,
+            error: true,
+            message: `WebAgent failed: ${error.message}`,
+            url: params.url,
+            task: params.task,
+            timestamp: new Date().toISOString(),
+            agent: 'WebAgent'
+        };
+    }
+}
+
+/**
+ * Determine the best approach for the current iteration
+ */
+async function determineApproach(url, task, method, previousSteps, iteration) {
+    const systemPrompt = `You are a web automation strategist. Based on the task, URL, and previous steps, determine the best approach for this iteration.
+
+CRITICAL STRATEGY: Always inspect the page content BEFORE attempting interactions!
+
+Available methods:
+1. 'browse' - Navigate and read content using browser (USE THIS FIRST to see page structure)
+2. 'scrape' - Simple HTTP request and HTML parsing for static content
+3. 'interact' - Complex interactions like clicking, filling forms, waiting for dynamic content (ONLY after browsing/scraping)
+4. 'analyze' - Analyze previous results to determine completion or next steps
+
+MANDATORY WORKFLOW:
+- Iteration 1: ALWAYS use 'browse' or 'scrape' to inspect the page first
+- Iteration 2+: Use 'interact' only if you have seen the page structure from previous steps
+- Never use 'interact' without first having page inspection data
+- Work with ANY website type (social media, news, corporate, gaming, job portals, etc.)
+
+Current context:
+- URL: ${url}
+- Task: ${task}
+- Iteration: ${iteration}
+- Method preference: ${method}
+- Previous steps: ${JSON.stringify(previousSteps.slice(-2))} // Last 2 steps only
+
+Has page been inspected? ${previousSteps.some(step => 
+    step.method === 'browse' || step.method === 'scrape'
+) ? 'YES - Page structure known' : 'NO - Must inspect first'}
+
+Respond with JSON:
+{
+  "method": "browse|scrape|interact|analyze",
+  "instructions": "specific instructions for this step",
+  "reasoning": "why this method was chosen based on inspection status"
+}
+
+RULES:
+- If page hasn't been inspected (browsed/scraped), MUST choose 'browse' or 'scrape'
+- Only choose 'interact' if previous steps show actual page elements
+- For any task requiring interaction, first 'browse' to see elements, then 'interact'
+- Choose 'browse' for dynamic sites, 'scrape' for simple static sites
+- No hardcoded assumptions about website types or structures`;
+
+    const userPrompt = `Determine the best approach for iteration ${iteration}. 
+
+CRITICAL: If this is iteration 1 OR if no previous steps show page inspection (browse/scrape), you MUST choose 'browse' or 'scrape' first.
+Only choose 'interact' if you have actual page structure data from previous steps.
+
+Method preference: ${method === 'auto' ? 'choose the most appropriate' : method}`;
+
+    try {
+        const response = await callLangChain(systemPrompt, userPrompt);
+        // Clean and parse JSON response
+        const cleanedResponse = response
+            .replace(/```json/g, '')
+            .replace(/```/g, '')
+            .trim();
+        
+        const jsonStart = cleanedResponse.indexOf('{');
+        const jsonEnd = cleanedResponse.lastIndexOf('}') + 1;
+        const jsonString = cleanedResponse.slice(jsonStart, jsonEnd);
+        const parsed = JSON.parse(jsonString);
+        
+        return {
+            method: parsed.method,
+            instructions: parsed.instructions,
+            reasoning: parsed.reasoning
+        };
+    } catch (error) {
+        console.warn('[WebAgent] Failed to determine approach, using intelligent fallback');
+        
+        // Intelligent fallback based on iteration and previous steps
+        const hasPageInspection = previousSteps.some(step => 
+            step.method === 'browse' || step.method === 'scrape'
+        );
+        
+        let fallbackMethod;
+        if (iteration === 1 || !hasPageInspection) {
+            // First iteration or no page inspection yet - must inspect first
+            fallbackMethod = 'browse'; // Default to browse for any website type
+        } else {
+            // Have page inspection, can now interact
+            fallbackMethod = method === 'auto' ? 'interact' : method;
+        }
+        
+        return {
+            method: fallbackMethod,
+            instructions: `Fallback: ${fallbackMethod === 'browse' ? 'Navigate and inspect page structure' : 
+                         fallbackMethod === 'scrape' ? 'Scrape and analyze page content' : 
+                         'Perform the requested task based on known page structure'}`,
+            reasoning: `Fallback approach due to planning error. ${hasPageInspection ? 'Page inspected, can interact' : 'Must inspect page first'}`
+        };
+    }
+}
+
+/**
+ * Perform web scraping using HTTP requests - Generic for any website
+ */
+async function performScraping(url, task, instructions) {
+    try {
+        console.log(`[WebAgent] Scraping: ${url}`);
+        
+        // Use the URL as provided - no hardcoded assumptions
+        let targetUrl = url;
+        
+        const response = await axios.get(targetUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
+            timeout: 30000
+        });
+
+        const $ = cheerio.load(response.data);
+        
+        // Generic data extraction for any website
+        const extractedData = {
+            title: $('title').text().trim(),
+            headings: $('h1, h2, h3').map((i, el) => $(el).text().trim()).get().filter(text => text.length > 0).slice(0, 10),
+            paragraphs: $('p').map((i, el) => $(el).text().trim()).get().filter(text => text.length > 50).slice(0, 5),
+            links: $('a[href]').map((i, el) => ({ text: $(el).text().trim(), href: $(el).attr('href') })).get().filter(link => link.text.length > 0).slice(0, 20),
+            images: $('img[src]').map((i, el) => ({ alt: $(el).attr('alt'), src: $(el).attr('src') })).get().slice(0, 10),
+            
+            // Interactive elements
+            forms: $('form').length,
+            buttons: $('button, input[type="submit"], input[type="button"]').map((i, el) => ({
+                text: $(el).text().trim() || $(el).val() || '',
+                type: $(el).attr('type') || 'button',
+                id: $(el).attr('id') || '',
+                class: $(el).attr('class') || ''
+            })).get().slice(0, 10),
+            
+            // Input fields
+            inputs: $('input, textarea, select').map((i, el) => ({
+                type: $(el).attr('type') || 'text',
+                name: $(el).attr('name') || '',
+                id: $(el).attr('id') || '',
+                placeholder: $(el).attr('placeholder') || '',
+                class: $(el).attr('class') || ''
+            })).get().slice(0, 15),
+            
+            // Lists and structured content
+            lists: $('ul, ol').map((i, el) => ({
+                type: el.tagName.toLowerCase(),
+                items: $(el).find('li').map((j, li) => $(li).text().trim()).get().slice(0, 10)
+            })).get().slice(0, 5),
+            
+            // Tables
+            tables: $('table').map((i, el) => ({
+                headers: $(el).find('th').map((j, th) => $(th).text().trim()).get(),
+                rows: $(el).find('tr').slice(0, 5).map((j, tr) => 
+                    $(tr).find('td').map((k, td) => $(td).text().trim()).get()
+                ).get()
+            })).get().slice(0, 3),
+            
+            // Meta information
+            meta: {
+                description: $('meta[name="description"]').attr('content') || '',
+                keywords: $('meta[name="keywords"]').attr('content') || '',
+                viewport: $('meta[name="viewport"]').attr('content') || ''
+            },
+            
+            // Content indicators
+            hasContent: response.data.length > 1000,
+            contentLength: response.data.length,
+            totalElements: {
+                divs: $('div').length,
+                spans: $('span').length,
+                links: $('a').length,
+                images: $('img').length,
+                forms: $('form').length,
+                buttons: $('button').length,
+                inputs: $('input').length
+            }
+        };
+
+        // AI analysis for generic web content
+        const analysisPrompt = `Analyze this scraped web data and extract information relevant to the task: "${task}"
+
+Web Data:
+${JSON.stringify(extractedData, null, 2)}
+
+Instructions: ${instructions}
+
+Focus on:
+1. Content that matches the task requirements
+2. Interactive elements (forms, buttons, inputs)
+3. Navigation and structural elements
+4. Any data or information relevant to the user's task
+5. Whether the page contains what's needed or if navigation is required
+
+Extract and return the most relevant information for the task, regardless of website type.`;
+
+        const analysis = await callLangChain(
+            'You are a web content analyst. Extract and summarize the most relevant information for the given task from any type of website.',
+            analysisPrompt
+        );
+        console.log('[WebAgent] Scraping analysis completed');
+
+        return {
+            method: 'scrape',
+            url: targetUrl,
+            originalUrl: url,
+            success: true,
+            extractedData: extractedData,
+            analysis: analysis,
+            contentLength: response.data.length,
+            statusCode: response.status
+        };
+
+    } catch (error) {
+        console.error('[WebAgent] Scraping error:', error.message);
+        return {
+            method: 'scrape',
+            url: targetUrl,
+            originalUrl: url,
+            success: false,
+            error: error.message,
+            errorType: error.code || 'SCRAPING_ERROR'
+        };
+    }
+}
+
+/**
+ * Perform web browsing using Playwright - Generic for any website
+ */
+async function performBrowsing(page, url, task, instructions) {
+    try {
+        console.log(`[WebAgent] Browsing: ${url}`);
+        
+        // Use the URL as provided - no hardcoded assumptions
+        let targetUrl = url;
+        
+        // Robust navigation with multiple strategies
+        let navigationSuccess = false;
+        const maxNavigationAttempts = 3;
+        
+        for (let attempt = 1; attempt <= maxNavigationAttempts; attempt++) {
+            try {
+                console.log(`[WebAgent] Navigation attempt ${attempt}/${maxNavigationAttempts}`);
+                
+                // Try different wait strategies based on attempt
+                let waitUntil;
+                switch (attempt) {
+                    case 1: waitUntil = 'domcontentloaded'; break;
+                    case 2: waitUntil = 'load'; break;
+                    case 3: waitUntil = 'networkidle'; break;
+                }
+                
+                await page.goto(targetUrl, { 
+                    waitUntil: waitUntil, 
+                    timeout: 30000 
+                });
+                
+                // Wait for page to stabilize
+                await page.waitForTimeout(2000);
+                
+                // Check if page loaded successfully
+                const pageUrl = page.url();
+                const title = await page.title();
+                
+                if (pageUrl && title && !pageUrl.includes('error') && !title.includes('Error')) {
+                    navigationSuccess = true;
+                    console.log(`[WebAgent] Navigation successful on attempt ${attempt}`);
+                    break;
+                } else {
+                    console.warn(`[WebAgent] Page may not have loaded correctly on attempt ${attempt}:`, { pageUrl, title });
+                }
+                
+            } catch (navError) {
+                console.warn(`[WebAgent] Navigation attempt ${attempt} failed:`, navError.message);
+                if (attempt < maxNavigationAttempts) {
+                    await page.waitForTimeout(1000 * attempt); // Exponential backoff
+                } else {
+                    throw navError;
+                }
+            }
+        }
+        
+        if (!navigationSuccess) {
+            throw new Error('Failed to navigate after multiple attempts');
+        }
+        
+        // Wait for any dynamic content to load
+        try {
+            await page.waitForSelector('body', { timeout: 5000 });
+            await page.waitForTimeout(1000); // Additional stability wait
+        } catch (bodyWaitError) {
+            console.warn('[WebAgent] Body selector not found, continuing anyway');
+        }
+        
+        // Extract comprehensive DOM structure for better AI analysis
+        console.log('[WebAgent] Extracting comprehensive DOM structure...');
+        const pageInfo = await extractComprehensiveDOM(page, 2, false);
+        // Take screenshot for debugging if needed
+        let screenshotTaken = false;
+        let screenshotSize = 0;
+        try {
+            const screenshot = await page.screenshot({ fullPage: false });
+            screenshotTaken = true;
+            screenshotSize = screenshot.length;
+        } catch (screenshotError) {
+            console.warn('[WebAgent] Screenshot failed:', screenshotError.message);
+        }
+
+        // AI analysis for generic web browsing
+        const analysisPrompt = `Analyze this browsed web page content for the task: "${task}"
+
+Page Information:
+${JSON.stringify(pageInfo, null, 2)}
+
+Instructions: ${instructions}
+
+Based on this page content, provide analysis and suggest next steps if needed. Focus on:
+1. Key information found relevant to the task
+2. Whether the page loaded successfully and shows relevant content
+3. What interactions can be performed on this page
+4. Any issues encountered with page loading or content extraction
+5. Available interactive elements (forms, buttons, links)
+
+Provide insights regardless of website type (e-commerce, news, social media, corporate, etc.)`;
+
+        const analysis = await callLangChain(
+            'You are a web content analyst. Analyze the page content and provide insights for the given task, working with any type of website.',
+            analysisPrompt
+        );
+
+        return {
+            method: 'browse',
+            url: targetUrl,
+            originalUrl: url,
+            finalUrl: pageInfo.url,
+            success: true,
+            pageInfo: pageInfo,
+            analysis: analysis,
+            screenshotTaken: screenshotTaken,
+            screenshotSize: screenshotSize,
+            navigationAttempts: maxNavigationAttempts
+        };
+
+    } catch (error) {
+        console.error('[WebAgent] Browsing error:', error.message);
+        
+        // Try to get current page info even on error
+        let errorPageInfo = null;
+        try {
+            if (page) {
+                errorPageInfo = {
+                    url: page.url(),
+                    title: await page.title(),
+                    error: error.message
+                };
+            }
+        } catch (infoError) {
+            console.warn('[WebAgent] Could not get error page info');
+        }
+        
+        return {
+            method: 'browse',
+            url: targetUrl,
+            originalUrl: url,
+            success: false,
+            error: error.message,
+            errorPageInfo: errorPageInfo
+        };
+    }
+}
+
+/**
+ * Perform web interactions using Playwright - Enhanced with better error handling
+ */
+async function performInteraction(page, url, task, instructions, previousSteps) {
+    try {
+        console.log(`[WebAgent] Interacting with: ${url}`);
+        
+        // Navigation logic with better error handling
+        const currentUrl = page.url();
+        const needsNavigation = !currentUrl || currentUrl === 'about:blank' || 
+            (currentUrl !== url && !currentUrl.startsWith(new URL(url).origin));
+        
+        if (needsNavigation) {
+            console.log(`[WebAgent] Navigating to: ${url} (from ${currentUrl})`);
+            
+            let navigationSuccess = false;
+            const maxAttempts = 2;
+            
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    await page.goto(url, { 
+                        waitUntil: attempt === 1 ? 'domcontentloaded' : 'load', 
+                        timeout: 30000 
+                    });
+                    
+                    await page.waitForTimeout(2000);
+                    navigationSuccess = true;
+                    break;
+                } catch (navError) {
+                    console.warn(`[WebAgent] Navigation attempt ${attempt} failed:`, navError.message);
+                    if (attempt === maxAttempts) {
+                        throw navError;
+                    }
+                    await page.waitForTimeout(1000);
+                }
+            }
+            
+            if (!navigationSuccess) {
+                throw new Error('Navigation failed after multiple attempts');
+            }
+        } else {
+            console.log(`[WebAgent] Staying on current page: ${currentUrl}`);
+            await page.waitForTimeout(500);
+        }
+
+        // Get comprehensive page state for AI decision making
+        console.log('[WebAgent] Extracting page state for interaction analysis...');
+        const pageState = await extractComprehensiveDOM(page, 1, false);
+            const generateSelector = (element, index) => {
+                try {
+                    if (element.id && element.id.trim()) return `#${element.id}`;
+                    if (element.name && element.name.trim()) return `[name="${element.name}"]`;
+                    if (element.className && element.className.trim()) {
+                        const firstClass = element.className.split(' ')[0];
+                        if (firstClass) return `.${firstClass}`;
+                    }
+                    const tagName = element.tagName ? element.tagName.toLowerCase() : 'unknown';
+                    return `${tagName}:nth-of-type(${index + 1})`;
+                } catch (error) {
+                    return `element-${index}`;
+                }
+            };
+
+            try {
+                return {
+                    title: document.title || 'No title',
+                    url: window.location.href,
+                    forms: Array.from(document.querySelectorAll('form') || []).map((form, index) => {
+                        try {
+                            return {
+                                index,
+                                action: form.action || '',
+                                method: form.method || 'get',
+                                selector: generateSelector(form, index),
+                                inputs: Array.from(form.querySelectorAll('input, textarea, select') || []).map((input, inputIndex) => ({
+                                    type: input.type || 'text',
+                                    name: input.name || '',
+                                    id: input.id || '',
+                                    placeholder: input.placeholder || '',
+                                    value: input.value || '',
+                                    selector: generateSelector(input, inputIndex),
+                                    required: input.required || false
+                                })),
+                                submitButtons: Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])') || []).map((btn, btnIndex) => ({
+                                    text: (btn.textContent || btn.value || btn.title || '').trim(),
+                                    type: btn.type || 'button',
+                                    selector: generateSelector(btn, btnIndex),
+                                    isSubmit: true
+                                }))
+                            };
+                        } catch (formError) {
+                            return {
+                                index,
+                                error: 'Could not process form',
+                                selector: `form:nth-of-type(${index + 1})`
+                            };
+                        }
+                    }),
+                    buttons: Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]') || []).map((btn, index) => {
+                        try {
+                            return {
+                                index,
+                                text: (btn.textContent || btn.value || btn.title || '').trim(),
+                                type: btn.type || 'button',
+                                id: btn.id || '',
+                                className: btn.className || '',
+                                selector: generateSelector(btn, index),
+                                isSubmit: btn.type === 'submit' || (btn.tagName === 'BUTTON' && !btn.type),
+                                isSearchButton: /search|find|go/i.test((btn.textContent || btn.value || btn.title || btn.className || '').toLowerCase())
+                            };
+                        } catch (btnError) {
+                            return {
+                                index,
+                                text: 'Error processing button',
+                                selector: `button:nth-of-type(${index + 1})`
+                            };
+                        }
+                    }),
+                    links: Array.from(document.querySelectorAll('a[href]') || []).slice(0, 20).map((link, index) => ({
+                        index,
+                        text: (link.textContent || '').trim(),
+                        href: link.href,
+                        selector: generateSelector(link, index)
+                    })),
+                    searchInputs: Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input[name*="search"], input[placeholder*="search"], input[name="q"]') || []).map((input, index) => ({
+                        placeholder: input.placeholder || '',
+                        name: input.name || '',
+                        id: input.id || '',
+                        selector: generateSelector(input, index),
+                        isSearchBox: /search|query|q/i.test((input.name || input.placeholder || input.id || '').toLowerCase())
+                    })),
+                    hasContent: document.body && document.body.innerText.trim().length > 0,
+                    bodyLength: document.body ? document.body.innerText.length : 0
+                };
+            } catch (evalError) {
+                return {
+                    title: 'Error evaluating page',
+                    url: window.location.href,
+                    forms: [],
+                    buttons: [],
+                    links: [],
+                    searchInputs: [],
+                    hasContent: false,
+                    bodyLength: 0,
+                    error: evalError.message
+                };
+            }
+        });
+
+        // Enhanced AI prompt for generic website interaction
+        const interactionPrompt = `CRITICAL: You must ONLY use elements that are ACTUALLY PRESENT on the page. Do not make assumptions about element selectors.
+
+Based on the ACTUAL page state provided below, determine what interactions to perform for any type of website. You can specify multiple actions to be performed in sequence if needed.
+
+MANDATORY RULES:
+1. ONLY use selectors from the provided page state data - do not assume element IDs or classes
+2. You can ONLY use these action types: click, fill, type, select, wait, scroll, navigate, press
+3. Use the actual selectors found in the page state
+4. When filling input fields, consider following with appropriate submission actions
+5. Work with ANY website type (e-commerce, news, social media, corporate, gaming, job portals, etc.)
+
+AVAILABLE PAGE ELEMENTS:
+${pageState.content?.interactiveInputs?.length > 0 ? 
+  `INTERACTIVE INPUTS FOUND: ${JSON.stringify(pageState.content.interactiveInputs.slice(0, 5).map(input => ({
+    index: input.index, 
+    type: input.type,
+    name: input.name,
+    id: input.id,
+    placeholder: input.placeholder,
+    className: input.className
+  })), null, 2)}` : 
+  'NO INTERACTIVE INPUTS FOUND'}
+
+${pageState.content?.clickables?.length > 0 ? 
+  `CLICKABLE ELEMENTS FOUND: ${JSON.stringify(pageState.content.clickables.slice(0, 10).map(click => ({
+    index: click.index,
+    tagName: click.tagName,
+    text: click.text.substring(0, 50),
+    href: click.href,
+    className: click.className,
+    id: click.id
+  })), null, 2)}` : 
+  'NO CLICKABLE ELEMENTS FOUND'}
+
+${pageState.forms?.length > 0 ? 
+  `FORMS FOUND: ${JSON.stringify(pageState.forms.slice(0, 3).map(form => ({
+    index: form.index,
+    action: form.action,
+    method: form.method,
+    inputs: form.inputs?.slice(0, 3).map(inp => ({type: inp.type, name: inp.name, id: inp.id})),
+    submitButtons: form.submitButtons?.map(btn => ({text: btn.text, type: btn.type}))
+  })), null, 2)}` : 
+  'NO FORMS FOUND'}
+
+${pageState.content?.dataContainers?.length > 0 ? 
+  `DATA CONTAINERS FOUND: ${JSON.stringify(pageState.content.dataContainers.slice(0, 5).map(container => ({
+    index: container.index,
+    tagName: container.tagName,
+    className: container.className,
+    id: container.id,
+    hasLinks: container.hasLinks,
+    hasImages: container.hasImages,
+    textPreview: container.textContent.substring(0, 100)
+  })), null, 2)}` : 
+  'NO DATA CONTAINERS FOUND'}
+
+Task: "${task}"
+Instructions: ${instructions}
+Previous steps: ${JSON.stringify(previousSteps.slice(-2))}
+
+Page Info: Title="${pageState.title}", URL="${pageState.url}"
+
+To create selectors, use:
+- Element index: Use CSS nth-of-type selectors like "button:nth-of-type(1)", "input:nth-of-type(2)"
+- IDs: "#elementId" if available
+- Names: "[name='elementName']" if available  
+- Classes: ".className" if available
+- Tag + attribute: "input[type='text']", "button[type='submit']"
+
+RESPOND WITH JSON ONLY:
+{
+  "actions": [
+    {
+      "action": "click|fill|type|select|wait|scroll|navigate|press",
+      "target": "CSS selector based on page elements above",
+      "value": "value if needed",
+      "waitAfter": 1000,
+      "reasoning": "why this specific element and action"
+    }
+  ],
+  "multiStep": true/false,
+  "reasoning": "overall reasoning based on ACTUAL page elements found"
+}
+
+CRITICAL: If no relevant elements are found for the task, use "scroll" or "wait" actions to load more content, or suggest navigation.
+
+DO NOT use hardcoded selectors from specific websites!`;
+
+        const actionResponse = await callLangChain(
+            'You are a web interaction specialist. Determine the best interactions to perform based on the task and page state for any type of website. You MUST include submit actions after filling forms using click or press actions.',
+            interactionPrompt
+        );
+
+        let actionResults = [];
+        try {
+            // Enhanced JSON parsing with better error recovery
+            console.log('[WebAgent] Raw interaction response:', actionResponse);
+            const cleanedResponse = actionResponse
+                .replace(/```json/g, '')
+                .replace(/```/g, '')
+                .trim();
+            
+            const jsonStart = cleanedResponse.indexOf('{');
+            const jsonEnd = cleanedResponse.lastIndexOf('}') + 1;
+            
+            if (jsonStart === -1 || jsonEnd <= jsonStart) {
+                throw new Error('No valid JSON found in response');
+            }
+            
+            const jsonString = cleanedResponse.slice(jsonStart, jsonEnd);
+            const parsedResponse = JSON.parse(jsonString);
+            
+            console.log('[WebAgent] Parsed interaction actions:', parsedResponse);
+            
+            const actions = Array.isArray(parsedResponse.actions) ? parsedResponse.actions : [parsedResponse];
+            console.log(`[WebAgent] Planning to perform ${actions.length} action(s)`);
+
+            // Execute actions in sequence
+            for (let i = 0; i < actions.length; i++) {
+                const action = actions[i];
+                console.log(`[WebAgent] Executing action ${i + 1}/${actions.length}:`, action);
+                
+                const result = await performSpecificAction(page, action);
+                actionResults.push(result);
+                
+                // Wait after action if specified
+                const waitTime = action.waitAfter || (i < actions.length - 1 ? 1500 : 1000);
+                await page.waitForTimeout(waitTime);
+                
+                // If action failed, log it but continue with next actions
+                if (!result.success) {
+                    console.warn(`[WebAgent] Action ${i + 1} failed:`, result.error);
+                    // For critical actions like navigation, we might want to stop
+                    if (action.action === 'navigate') {
+                        break;
+                    }
+                }
+            }
+
+        } catch (parseError) {
+            console.warn('[WebAgent] Failed to parse actions:', parseError.message);
+            console.log('[WebAgent] Performing basic interaction fallback');
+            const fallbackResult = await performBasicInteraction(page, task);
+            actionResults.push(fallbackResult);
+        }
+
+        // Get updated page state after all interactions with timeout
+        await page.waitForTimeout(1000);
+        
+        let updatedPageInfo;
+        try {
+            updatedPageInfo = await page.evaluate(() => {
+                return {
+                    title: document.title || 'No title',
+                    url: window.location.href,
+                    content: document.body ? document.body.innerText.slice(0, 2000) : 'No content',
+                    hasChanged: true
+                };
+            });
+        } catch (updateError) {
+            updatedPageInfo = {
+                title: 'Error getting updated info',
+                url: currentUrl,
+                content: 'Could not retrieve updated page content',
+                hasChanged: false,
+                error: updateError.message
+            };
+        }
+
+        return {
+            method: 'interact',
+            url: currentUrl,
+            finalUrl: updatedPageInfo.url,
+            success: true,
+            initialPageState: pageState,
+            actionsPerformed: actionResults,
+            totalActions: actionResults.length,
+            successfulActions: actionResults.filter(r => r.success).length,
+            updatedPageInfo: updatedPageInfo,
+            interactionCompleted: true
+        };
+
+    } catch (error) {
+        console.error('[WebAgent] Interaction error:', error.message);
+        return {
+            method: 'interact',
+            url: url,
+            success: false,
+            error: error.message,
+            errorType: error.name || 'Unknown'
+        };
+    }
+}
+
+/**
+ * Perform specific action on page - Enhanced with better error handling and element targeting
+ */
+async function performSpecificAction(page, action) {
+    const { action: actionType, target, value, reasoning, waitAfter } = action;
+    
+    console.log(`[WebAgent] Performing ${actionType} on "${target}"${value ? ` with value "${value}"` : ''}: ${reasoning}`);
+    
+    try {
+        // Add small delay before each action for stability
+        await page.waitForTimeout(300);
+        
+        switch (actionType) {
+            case 'click':
+                await performClickAction(page, target);
+                break;
+                
+            case 'fill':
+                await performFillAction(page, target, value);
+                break;
+                
+            case 'type':
+                await performTypeAction(page, target, value);
+                break;
+                
+            case 'select':
+                await page.selectOption(target, value);
+                break;
+                
+            case 'wait':
+                const waitTime = parseInt(value) || parseInt(waitAfter) || 3000;
+                await page.waitForTimeout(waitTime);
+                break;
+                
+            case 'scroll':
+                await performScrollAction(page, value);
+                break;
+                
+            case 'navigate':
+                await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await page.waitForTimeout(1500);
+                break;
+                
+            case 'press':
+                await performPressAction(page, target, value);
+                break;
+                
+            default:
+                console.warn(`[WebAgent] Unsupported action type: ${actionType}, skipping...`);
+                // Return failure for unsupported actions to help AI learn
+                throw new Error(`Unsupported action type: ${actionType}. Only supported: click, fill, type, select, wait, scroll, navigate, press`);
+        }
+        
+        return {
+            actionType,
+            target,
+            value,
+            success: true,
+            reasoning,
+            timestamp: new Date().toISOString()
+        };
+        
+    } catch (error) {
+        console.error(`[WebAgent] Action ${actionType} failed:`, error.message);
+        return {
+            actionType,
+            target,
+            value,
+            success: false,
+            error: error.message,
+            reasoning,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+/**
+ * Enhanced click action with multiple strategies
+ */
+async function performClickAction(page, target) {
+    const strategies = [
+        // Strategy 1: Direct selector click
+        async () => {
+            await page.click(target, { timeout: 5000 });
+        },
+        // Strategy 2: Wait for selector then click
+        async () => {
+            await page.waitForSelector(target, { timeout: 5000 });
+            await page.click(target);
+        },
+        // Strategy 3: Force click if element exists
+        async () => {
+            await page.click(target, { force: true, timeout: 5000 });
+        },
+        // Strategy 4: Click by text content (if target looks like text)
+        async () => {
+            if (!target.includes('[') && !target.includes('#') && !target.includes('.')) {
+                await page.click(`text="${target}"`, { timeout: 5000 });
+            } else {
+                throw new Error('Not a text target');
+            }
+        },
+        // Strategy 5: Try common button selectors
+        async () => {
+            const possibleSelectors = [
+                `[value*="${target}"]`,
+                `[title*="${target}"]`,
+                `button:has-text("${target}")`,
+                `input[value="${target}"]`
+            ];
+            
+            for (const selector of possibleSelectors) {
+                try {
+                    const element = await page.$(selector);
+                    if (element) {
+                        await element.click();
+                        return;
+                    }
+                } catch (e) {
+                    // Continue to next selector
+                }
+            }
+            throw new Error('No clickable element found');
+        }
+    ];
+    
+    let lastError;
+    for (let i = 0; i < strategies.length; i++) {
+        try {
+            console.log(`[WebAgent] Click strategy ${i + 1}/${strategies.length} for target: ${target}`);
+            await strategies[i]();
+            console.log(`[WebAgent] Click successful with strategy ${i + 1}`);
+            return;
+        } catch (error) {
+            console.warn(`[WebAgent] Click strategy ${i + 1} failed:`, error.message);
+            lastError = error;
+            await page.waitForTimeout(500); // Brief pause between strategies
+        }
+    }
+    
+    throw lastError || new Error('All click strategies failed');
+}
+
+/**
+ * Enhanced fill action with better error handling
+ */
+async function performFillAction(page, target, value) {
+    try {
+        // Wait for element to be available
+        await page.waitForSelector(target, { timeout: 10000 });
+        
+        // Clear the field first
+        await page.fill(target, '');
+        await page.waitForTimeout(200);
+        
+        // Fill with new value
+        if (value) {
+            await page.fill(target, value);
+            await page.waitForTimeout(200);
+        }
+    } catch (error) {
+        // Fallback: try alternative filling methods
+        try {
+            await page.focus(target);
+            await page.keyboard.press('Control+A'); // Select all
+            await page.keyboard.press('Delete');    // Delete
+            if (value) {
+                await page.type(target, value, { delay: 50 });
+            }
+        } catch (fallbackError) {
+            throw new Error(`Fill action failed: ${error.message}. Fallback also failed: ${fallbackError.message}`);
+        }
+    }
+}
+
+/**
+ * Enhanced type action
+ */
+async function performTypeAction(page, target, value) {
+    await page.waitForSelector(target, { timeout: 10000 });
+    await page.focus(target);
+    if (value) {
+        await page.type(target, value, { delay: 50 });
+    }
+}
+
+/**
+ * Enhanced scroll action
+ */
+async function performScrollAction(page, value) {
+    if (value && !isNaN(value)) {
+        // Scroll specific amount
+        await page.evaluate((scrollAmount) => window.scrollBy(0, scrollAmount), parseInt(value));
+    } else {
+        // Scroll down one viewport
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    }
+    // Wait for any lazy-loaded content
+    await page.waitForTimeout(1000);
+}
+
+/**
+ * Enhanced press action
+ */
+async function performPressAction(page, target, value) {
+    const key = value || 'Enter';
+    
+    try {
+        if (target && target !== 'body' && !target.includes('document')) {
+            // Press key on specific element
+            await page.focus(target);
+            await page.keyboard.press(key);
+        } else {
+            // Press key globally
+            await page.keyboard.press(key);
+        }
+    } catch (error) {
+        // Fallback to global key press
+        console.warn(`[WebAgent] Focused key press failed, trying global: ${error.message}`);
+        await page.keyboard.press(key);
+    }
+}
+
+/**
+ * Perform basic interaction when AI planning fails
+ */
+async function performBasicInteraction(page, task) {
+    try {
+        // Basic interaction: scroll and wait
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+        await page.waitForTimeout(2000);
+        
+        return {
+            actionType: 'basic_scroll_wait',
+            success: true,
+            reasoning: 'Fallback basic interaction'
+        };
+    } catch (error) {
+        return {
+            actionType: 'basic_interaction',
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Analyze results from previous steps
+ */
+async function analyzeResults(steps, task) {
+    const analysisPrompt = `Analyze all the steps taken so far for the task: "${task}"
+
+Steps taken:
+${JSON.stringify(steps, null, 2)}
+
+Provide a comprehensive analysis of:
+1. What information has been gathered
+2. Whether the task has been completed
+3. What additional steps might be needed
+4. Summary of findings`;
+
+    const analysis = await callLangChain(
+        'You are a web task analyst. Analyze the steps taken and provide insights about task completion.',
+        analysisPrompt
+    );
+
+    return {
+        method: 'analyze',
+        success: true,
+        analysis: analysis,
+        totalSteps: steps.length
+    };
+}
+
+/**
+ * Check if the task has been completed
+ */
+async function checkTaskCompletion(task, allSteps, lastStepResult) {
+    const completionPrompt = `Determine if the web task has been completed based on all steps taken.
+
+Task: "${task}"
+
+All steps:
+${JSON.stringify(allSteps, null, 2)}
+
+Last step result:
+${JSON.stringify(lastStepResult, null, 2)}
+
+Respond with JSON:
+{
+  "isCompleted": true/false,
+  "confidence": 0-100,
+  "finalResult": "summary if completed",
+  "nextStepSuggestion": "what to do next if not completed",
+  "reasoning": "explanation of the decision"
+}`;
+
+    try {
+        const response = await callLangChain(
+            'You are a task completion evaluator. Determine if the web task has been successfully completed.',
+            completionPrompt
+        );
+
+        // Clean and parse JSON response
+        const cleanedResponse = response
+            .replace(/```json/g, '')
+            .replace(/```/g, '')
+            .trim();
+
+        const jsonStart = cleanedResponse.indexOf('{');
+        const jsonEnd = cleanedResponse.lastIndexOf('}') + 1;
+        const jsonString = cleanedResponse.slice(jsonStart, jsonEnd);
+        const result = JSON.parse(jsonString);
+        
+        return result;
+    } catch (error) {
+        console.warn('[WebAgent] Failed to check completion, assuming not completed');
+        return {
+            isCompleted: false,
+            confidence: 0,
+            nextStepSuggestion: 'Continue with next iteration',
+            reasoning: 'Failed to evaluate completion'
+        };
+    }
+}
+
+/**
+ * Handle errors during iterations
+ */
+async function handleIterationError(error, currentIteration, maxIterations) {
+    console.log(`[WebAgent] Handling error in iteration ${currentIteration}`);
+    
+    // Continue for certain types of errors
+    if (error.message.includes('timeout') || 
+        error.message.includes('navigation') ||
+        error.message.includes('network')) {
+        return currentIteration < maxIterations - 1; // Continue if not last iteration
+    }
+    
+    // Stop for critical errors
+    if (error.message.includes('browser') || 
+        error.message.includes('crash')) {
+        return false;
+    }
+    
+    // Default: continue unless it's the last iteration
+    return currentIteration < maxIterations - 1;
+}
+
+/**
+ * Generate partial result when task is not fully completed
+ */
+async function generatePartialResult(task, allSteps) {
+    const summaryPrompt = `Generate a partial result summary for the incomplete web task.
+
+Task: "${task}"
+
+All steps taken:
+${JSON.stringify(allSteps, null, 2)}
+
+Provide a summary of what was accomplished and what information was gathered, even though the task wasn't fully completed.`;
+
+    try {
+        const summary = await callLangChain(
+            'You are a task summarizer. Create a partial result summary from incomplete web task steps.',
+            summaryPrompt
+        );
+        
+        return {
+            status: 'partially_completed',
+            summary: summary,
+            stepsCompleted: allSteps.length,
+            information: 'Task was not fully completed but some information was gathered'
+        };
+    } catch (error) {
+        return {
+            status: 'incomplete',
+            summary: 'Task could not be completed within the iteration limit',
+            stepsCompleted: allSteps.length,
+            error: 'generate summary'
+        };
+    }
+}
+
+/**
+ * Launch browser with appropriate configuration
+ */
+async function launchBrowser(options = {}) {
+    const browserOptions = {
+        headless: false, // Default to headless for reliability
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=VizDisplayCompositor',
+            '--disable-extensions',
+            '--disable-plugins',
+            '--disable-images', // Faster loading
+            '--disable-javascript-harmony-shipping',
+            '--memory-pressure-off',
+            '--max_old_space_size=4096'
+        ],
+        ...options
+    };
+    
+    console.log('[WebAgent] Launching browser with headless =', browserOptions.headless);
+    const browser = await chromium.launch(browserOptions);
+    
+    // Configure context for better compatibility
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+        permissions: [],
+        extraHTTPHeaders: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+    });
+    
+    return { browser, context };
+}
+
+/**
+ * Check if the page has been properly inspected with DOM elements
+ */
+function hasValidPageInspection(previousSteps) {
+    for (const step of previousSteps) {
+        if ((step.method === 'browse' || step.method === 'scrape') && step.result && step.result.success) {
+            // Check if we have actual page structure data
+            if (step.method === 'browse' && step.result.pageInfo) {
+                const pageInfo = step.result.pageInfo;
+                if (pageInfo.buttons?.length > 0 || pageInfo.forms?.length > 0 || 
+                    pageInfo.inputs?.length > 0 || pageInfo.content?.clickables?.length > 0) {
+                    return true;
+                }
+            }
+            
+            if (step.method === 'scrape' && step.result.extractedData) {
+                const data = step.result.extractedData;
+                if (data.forms > 0 || data.buttons?.length > 0 || data.inputs?.length > 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Extract comprehensive DOM structure for AI analysis
+ * This function provides BeautifulSoup-like functionality to send complete page structure to AI
+ */
+async function extractComprehensiveDOM(page, maxDepth = 3, includeStyles = false) {
+    try {
+        const domData = await page.evaluate((maxDepth, includeStyles) => {
+            const result = {
+                pageInfo: {
+                    title: document.title || '',
+                    url: window.location.href,
+                    readyState: document.readyState,
+                    viewport: {
+                        width: window.innerWidth,
+                        height: window.innerHeight
+                    }
+                },
+                fullDOM: null,
+                interactiveElements: [],
+                semanticContent: {}
+            };
+
+            // Function to recursively extract DOM structure
+            function extractElement(element, depth = 0, parentSelector = '') {
+                if (depth > maxDepth) return null;
+
+                try {
+                    const tagName = element.tagName ? element.tagName.toLowerCase() : '';
+                    const id = element.id || '';
+                    const classList = Array.from(element.classList || []);
+                    const attributes = {};
+                    
+                    // Extract all attributes
+                    if (element.attributes) {
+                        for (let i = 0; i < element.attributes.length; i++) {
+                            const attr = element.attributes[i];
+                            attributes[attr.name] = attr.value;
+                        }
+                    }
+
+                    // Generate CSS selector for this element
+                    let selector = tagName;
+                    if (id) selector += `#${id}`;
+                    if (classList.length > 0) selector += `.${classList.join('.')}`;
+                    
+                    // Build full selector path
+                    const fullSelector = parentSelector ? `${parentSelector} > ${selector}` : selector;
+
+                    // Extract text content (direct text only, not from children)
+                    let textContent = '';
+                    if (element.childNodes) {
+                        for (let node of element.childNodes) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                textContent += node.textContent.trim() + ' ';
+                            }
+                        }
+                    }
+                    textContent = textContent.trim();
+
+                    const elementData = {
+                        tagName,
+                        id,
+                        classList,
+                        attributes,
+                        selector: fullSelector,
+                        textContent,
+                        isVisible: element.offsetParent !== null && window.getComputedStyle(element).visibility !== 'hidden',
+                        boundingRect: null,
+                        children: []
+                    };
+
+                    // Add bounding rectangle if element is visible
+                    if (elementData.isVisible) {
+                        try {
+                            const rect = element.getBoundingClientRect();
+                            elementData.boundingRect = {
+                                top: rect.top,
+                                left: rect.left,
+                                width: rect.width,
+                                height: rect.height
+                            };
+                        } catch (e) {
+                            // Ignore rect extraction errors
+                        }
+                    }
+
+                    // Add styles if requested
+                    if (includeStyles && elementData.isVisible) {
+                        try {
+                            const computedStyles = window.getComputedStyle(element);
+                            elementData.styles = {
+                                display: computedStyles.display,
+                                position: computedStyles.position,
+                                backgroundColor: computedStyles.backgroundColor,
+                                color: computedStyles.color,
+                                fontSize: computedStyles.fontSize
+                            };
+                        } catch (e) {
+                            // Ignore style extraction errors
+                        }
+                    }
+
+                    // Recursively process children
+                    if (element.children && depth < maxDepth) {
+                        for (let child of element.children) {
+                            const childData = extractElement(child, depth + 1, fullSelector);
+                            if (childData) {
+                                elementData.children.push(childData);
+                            }
+                        }
+                    }
+
+                    return elementData;
+                } catch (e) {
+                    return {
+                        tagName: element.tagName ? element.tagName.toLowerCase() : 'unknown',
+                        error: e.message,
+                        textContent: element.textContent ? element.textContent.substring(0, 50) : ''
+                    };
+                }
+            }
+
+            // Extract complete DOM structure
+            const bodyElement = document.body || document.documentElement;
+            result.fullDOM = extractElement(bodyElement, 0);
+
+            // Extract all interactive elements with detailed information
+            const interactiveSelectors = [
+                'a[href]',
+                'button',
+                'input',
+                'textarea',
+                'select',
+                '[onclick]',
+                '[role="button"]',
+                '[tabindex]',
+                'form'
+            ];
+
+            interactiveSelectors.forEach(selector => {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach((element, index) => {
+                    if (index < 50) { // Limit to prevent overwhelming
+                        try {
+                            const rect = element.getBoundingClientRect();
+                            const isVisible = element.offsetParent !== null && 
+                                           rect.width > 0 && 
+                                           rect.height > 0 && 
+                                           window.getComputedStyle(element).visibility !== 'hidden';
+
+                            const elementInfo = {
+                                tagName: element.tagName.toLowerCase(),
+                                type: element.type || '',
+                                id: element.id || '',
+                                classList: Array.from(element.classList || []),
+                                textContent: (element.textContent || element.value || '').trim().substring(0, 100),
+                                href: element.href || '',
+                                name: element.name || '',
+                                placeholder: element.placeholder || '',
+                                value: element.value || '',
+                                isVisible,
+                                boundingRect: isVisible ? {
+                                    top: rect.top,
+                                    left: rect.left,
+                                    width: rect.width,
+                                    height: rect.height
+                                } : null,
+                                selector: generateCSSSelectorForElement(element)
+                            };
+
+                            // Add form-specific information
+                            if (element.tagName.toLowerCase() === 'form') {
+                                elementInfo.action = element.action || '';
+                                elementInfo.method = element.method || 'get';
+                                elementInfo.inputCount = element.querySelectorAll('input, textarea, select').length;
+                            }
+
+                            result.interactiveElements.push(elementInfo);
+                        } catch (e) {
+                            // Skip elements that cause errors
+                        }
+                    }
+                });
+            });
+
+            // Extract semantic content (headings, articles, sections, etc.)
+            result.semanticContent = {
+                headings: Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6')).map(h => ({
+                    level: parseInt(h.tagName.charAt(1)),
+                    text: h.textContent.trim(),
+                    id: h.id || '',
+                    selector: generateCSSSelectorForElement(h)
+                })).slice(0, 20),
+
+                articles: Array.from(document.querySelectorAll('article, [role="article"]')).map(article => ({
+                    textContent: article.textContent.trim().substring(0, 300),
+                    selector: generateCSSSelectorForElement(article),
+                    headingCount: article.querySelectorAll('h1, h2, h3, h4, h5, h6').length,
+                    linkCount: article.querySelectorAll('a').length
+                })).slice(0, 10),
+
+                sections: Array.from(document.querySelectorAll('section, [role="section"], main, nav')).map(section => ({
+                    tagName: section.tagName.toLowerCase(),
+                    role: section.getAttribute('role') || '',
+                    textContent: section.textContent.trim().substring(0, 200),
+                    selector: generateCSSSelectorForElement(section),
+                    childElementCount: section.children.length
+                })).slice(0, 10),
+
+                lists: Array.from(document.querySelectorAll('ul, ol')).map(list => ({
+                    type: list.tagName.toLowerCase(),
+                    itemCount: list.querySelectorAll('li').length,
+                    items: Array.from(list.querySelectorAll('li')).map(li => 
+                        li.textContent.trim().substring(0, 100)
+                    ).slice(0, 10),
+                    selector: generateCSSSelectorForElement(list)
+                })).slice(0, 5),
+
+                tables: Array.from(document.querySelectorAll('table')).map(table => ({
+                    rowCount: table.querySelectorAll('tr').length,
+                    columnCount: table.querySelectorAll('th, td').length,
+                    headers: Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim()),
+                    selector: generateCSSSelectorForElement(table),
+                    hasCaption: table.querySelector('caption') !== null
+                })).slice(0, 3)
+            };
+
+            // Helper function to generate CSS selector for an element
+            function generateCSSSelectorForElement(element) {
+                if (element.id) {
+                    return `#${element.id}`;
+                }
+                
+                let selector = element.tagName.toLowerCase();
+                
+                if (element.classList.length > 0) {
+                    selector += '.' + Array.from(element.classList).join('.');
+                }
+                
+                // Add nth-child if no unique identifier
+                if (!element.id && element.classList.length === 0) {
+                    const parent = element.parentElement;
+                    if (parent) {
+                        const siblings = Array.from(parent.children).filter(child => 
+                            child.tagName === element.tagName
+                        );
+                        if (siblings.length > 1) {
+                            const index = siblings.indexOf(element) + 1;
+                            selector += `:nth-child(${index})`;
+                        }
+                    }
+                }
+                
+                return selector;
+            }
+
+            return result;
+        }, maxDepth, includeStyles);
+
+        console.log(`[WebAgent] Extracted comprehensive DOM with ${domData.interactiveElements.length} interactive elements`);
+        return domData;
+
+    } catch (error) {
+        console.error('[WebAgent] DOM extraction error:', error);
+        return {
+            pageInfo: { title: 'Error', url: '', readyState: 'error' },
+            fullDOM: null,
+            interactiveElements: [],
+            semanticContent: {},
+            error: error.message
+        };
+    }
+}
+
+module.exports = {
+    WebAgent
+};
