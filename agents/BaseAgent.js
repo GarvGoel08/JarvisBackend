@@ -24,8 +24,18 @@ async function BaseAgent(params) {
             lastAgentUsed = arguments[1] || null;
             progress = arguments[2] || {};
         } else {
-            // New signature: BaseAgent({userPrompt, lastAgentUsed, progress})
-            ({ userPrompt, lastAgentUsed = null, progress = {} } = params);
+            // New signature: BaseAgent({userPrompt, lastAgentUsed, progress, webAgentResult, agentResult})
+            ({ userPrompt, lastAgentUsed = null, progress = {}, webAgentResult, agentResult } = params);
+            
+            // If webAgentResult or agentResult is passed, include it in progress for context
+            if (webAgentResult) {
+                progress.webAgentResult = webAgentResult;
+                progress.lastAgentResult = webAgentResult;
+            }
+            if (agentResult) {
+                progress.agentResult = agentResult;
+                progress.lastAgentResult = agentResult;
+            }
         }
 
         // Validate inputs
@@ -102,10 +112,27 @@ Previous Context:
 - Last Agent: ${lastAgentUsed || 'None'}
 - Failed Agents: ${progress.failedAgents ? progress.failedAgents.join(', ') : 'None'}
 - Final Formulation Mode: ${progress.finalFormulation ? 'YES - Provide final comprehensive response' : 'NO'}
-- Progress Summary: ${JSON.stringify(progress)}
+
+${progress.lastAgentResult ? `
+Previous Agent Result:
+${JSON.stringify(progress.lastAgentResult, null, 2)}
+` : ''}
 
 ${progress.finalFormulation ? 
-    'IMPORTANT: You are in FINAL FORMULATION MODE. Provide a comprehensive, well-structured final response based on all available information. Do NOT route to other agents.' : 
+    `IMPORTANT: You are in FINAL FORMULATION MODE. 
+    
+    Analyze the agent results above and provide a comprehensive, well-structured final response based on the ACTUAL DATA found.
+    
+    Instructions:
+    - Extract specific details from the agent results (product names, prices, ratings, etc.)
+    - Format the information in a user-friendly way
+    - If products were found, list them clearly with details
+    - If no data was found, explain what happened and suggest alternatives
+    - Focus on the ACTUAL RESULTS, don't give generic advice
+    - Use clear formatting with bullet points or numbered lists
+    - Be specific and detailed based on the real data found
+    
+    Do NOT route to other agents.` : 
     'Please analyze this request and decide whether to provide a direct answer or route to a specialized agent.'
 }
 
@@ -136,9 +163,38 @@ Remember: Do NOT route to any agents listed in Failed Agents.`;
             
             // If we're in final formulation mode, prioritize the AI-generated response
             if (progress.finalFormulation) {
+                // Check if the prompt indicates we're trying to reprocess already formatted data
+                if (userPrompt.includes('WebAgent Results:') && userPrompt.includes('"result":')) {
+                    // This looks like we're being asked to reprocess already formatted data
+                    // Extract the actual formatted result from the WebAgent
+                    try {
+                        const webAgentMatch = userPrompt.match(/WebAgent Results:\s*({.*})/s);
+                        if (webAgentMatch) {
+                            const webAgentResult = JSON.parse(webAgentMatch[1]);
+                            if (webAgentResult.result && typeof webAgentResult.result === 'string' && 
+                                webAgentResult.result.includes('**Smartphones') && 
+                                webAgentResult.result.includes('### ')) {
+                                // This is already a formatted response, return it directly
+                                console.log('[BaseAgent] Detected already formatted result, returning as-is');
+                                return {
+                                    isCompleted: true,
+                                    response: webAgentResult.result,
+                                    timestamp: new Date().toISOString(),
+                                    agent: 'BaseAgent',
+                                    finalFormulation: true,
+                                    directPassthrough: true
+                                };
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('[BaseAgent] Failed to parse WebAgent result for passthrough check');
+                    }
+                }
+                
                 // In final formulation mode, the AI should provide a comprehensive response
                 // But we can still enhance it with extracted data if the response is too generic
-                if (finalResponse.length < 200 || finalResponse.includes('successfully navigated')) {
+                if (finalResponse.length < 200 || finalResponse.includes('successfully navigated') || 
+                    finalResponse.includes('I attempted to help')) {
                     const enhancedResponse = generateDetailedResponse(userPrompt, progress);
                     if (enhancedResponse && enhancedResponse.length > finalResponse.length) {
                         finalResponse = enhancedResponse;
@@ -241,7 +297,73 @@ Remember: Do NOT route to any agents listed in Failed Agents.`;
 function generateDetailedResponse(userPrompt, progress) {
     let response = '';
     
-    // Check if we have WebAgent results with useful data
+    // Check if we have WebAgent results with extracted product data
+    if (progress.lastAgentResult && progress.lastAgentResult.result) {
+        const agentResult = progress.lastAgentResult.result;
+        
+        // Check for extracted data from WebAgent
+        if (agentResult.extractedData && agentResult.extractedData.products && agentResult.extractedData.products.length > 0) {
+            const products = agentResult.extractedData.products;
+            const query = userPrompt.toLowerCase();
+            
+            if (query.includes('phone') && query.includes('20')) {
+                response = `# Phones Under ₹20,000 on Amazon India\n\n`;
+                response += `I found **${products.length} phones** under ₹20,000. Here are the details:\n\n`;
+                
+                products.forEach((product, index) => {
+                    response += `**${index + 1}. ${product.name || 'Product Name Not Available'}**\n`;
+                    if (product.brand) response += `   - Brand: ${product.brand}\n`;
+                    if (product.price) response += `   - Price: ${product.price}\n`;
+                    if (product.rating) response += `   - Rating: ${product.rating}/5\n`;
+                    if (product.reviewCount) response += `   - Reviews: ${product.reviewCount} reviews\n`;
+                    if (product.link) response += `   - Link: ${product.link}\n`;
+                    if (product.offers && product.offers.length > 0) {
+                        response += `   - Offers: ${product.offers.join(', ')}\n`;
+                    }
+                    response += '\n';
+                });
+                
+                response += `\n**Source:** ${agentResult.extractedData.pageUrl}\n`;
+                response += `**Last Updated:** ${agentResult.extractedData.extractionTime}\n`;
+                
+            } else {
+                // Generic product listing
+                response = `# Search Results\n\n`;
+                response += `I found **${products.length} products** matching your search. Here are the details:\n\n`;
+                
+                products.forEach((product, index) => {
+                    response += `**${index + 1}. ${product.name || 'Product Name Not Available'}**\n`;
+                    if (product.price) response += `   - Price: ${product.price}\n`;
+                    if (product.rating) response += `   - Rating: ${product.rating}/5\n`;
+                    if (product.reviewCount) response += `   - Reviews: ${product.reviewCount} reviews\n`;
+                    if (product.link) response += `   - Link: ${product.link}\n`;
+                    response += '\n';
+                });
+            }
+            
+            return response;
+        }
+        
+        // Check for partial results or summary
+        if (agentResult.summary) {
+            response = `# Search Results Summary\n\n`;
+            response += `${agentResult.summary}\n\n`;
+            
+            if (agentResult.status === 'Incomplete') {
+                response += `**Note:** The search was not fully completed, but here's what I found:\n`;
+                response += `- Visited: ${progress.lastAgentResult.url}\n`;
+                response += `- Iterations completed: ${progress.lastAgentResult.totalIterations || 'Unknown'}\n\n`;
+                response += `**Suggestions:**\n`;
+                response += `1. Try visiting the website directly\n`;
+                response += `2. Use the website's search and filter options\n`;
+                response += `3. Check for mobile apps which might have better performance\n`;
+            }
+            
+            return response;
+        }
+    }
+    
+    // Fallback for legacy WebAgent results or no structured data
     if (progress.lastAgentResult && progress.lastAgentResult.allSteps) {
         const steps = progress.lastAgentResult.allSteps;
         let foundProducts = [];
@@ -285,10 +407,10 @@ function generateDetailedResponse(userPrompt, progress) {
         
         // Generate response based on extracted information
         if (userPrompt.toLowerCase().includes('phone') && userPrompt.toLowerCase().includes('20')) {
-            response = `# Phones Under ₹20,000 in India on Flipkart\n\n`;
+            response = `# Phones Under ₹20,000 Search Results\n\n`;
             
             if (totalProducts) {
-                response += `I found **${totalProducts} phones** under ₹20,000 available on Flipkart. Here are some key findings:\n\n`;
+                response += `I found **${totalProducts} phones** under ₹20,000 available. Here are some key findings:\n\n`;
             }
             
             if (foundProducts.length > 0) {

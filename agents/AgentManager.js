@@ -199,7 +199,7 @@ class AgentManager {
                 taskRecord.processingTime = Date.now() - startTime;
                 
                 // Always call BaseAgent at the end to formulate final structured response
-                if (routingResult && !routingResult.error) {
+                if (routingResult && !routingResult.error && !routingResult.finallyFormulated) {
                     console.log(`[AgentManager] Calling BaseAgent to formulate final response`);
                     
                     const finalProgress = {
@@ -209,11 +209,25 @@ class AgentManager {
                         step: (progress.step || 0) + 1,
                         finalFormulation: true // Flag to indicate this is for final response formulation
                     };
+
+                    console.log(`[AgentManager] ${currentResult.nextAgent} result:`, routingResult);
                     
                     const finalResponse = await this.callAgent('BaseAgent', {
-                        userPrompt: `Please provide a comprehensive, well-structured response based on the results from ${currentResult.nextAgent}. Extract and present the key information in a user-friendly format. Original user query: "${userPrompt}"`,
+                        userPrompt: `Provide a comprehensive, well-structured response based on the WebAgent results below. Format and present the extracted data in a user-friendly way.
+                        
+Original user query: "${userPrompt}"
+
+WebAgent Results:
+${JSON.stringify(routingResult, null, 2)}
+
+Instructions:
+- If products were found, format them as a numbered list with names, prices, ratings, etc.
+- If no products were found, explain what happened and suggest alternatives
+- Be specific about the extracted data, don't give generic advice
+- Focus on presenting the actual results from WebAgent`,
                         lastAgentUsed: currentResult.nextAgent,
-                        progress: finalProgress
+                        progress: finalProgress,
+                        webAgentResult: routingResult // Pass the actual result data
                     });
                     
                     // Use the BaseAgent's final formulated response as the result
@@ -236,6 +250,11 @@ class AgentManager {
                         this.taskHistory.push(taskRecord);
                         return structuredResult;
                     }
+                } else if (routingResult && routingResult.finallyFormulated) {
+                    // Agent has already been processed through BaseAgent, return as-is
+                    console.log(`[AgentManager] ${currentResult.nextAgent} result already processed by BaseAgent, returning as-is`);
+                    this.taskHistory.push(taskRecord);
+                    return routingResult;
                 }
                 
                 // Store task history
@@ -336,9 +355,21 @@ class AgentManager {
                         };
                         
                         const finalResponse = await this.callAgent('BaseAgent', {
-                            userPrompt: `Please provide a comprehensive response based on the partial results from ${agentName}. Extract and present any useful information found. Original user query: "${originalPrompt}"`,
+                            userPrompt: `Provide a comprehensive response based on the partial/failed results from ${agentName}. Present any useful information found.
+
+Original user query: "${originalPrompt}"
+
+Agent Results:
+${JSON.stringify(result, null, 2)}
+
+Instructions:
+- Extract and present any partial data that was found
+- Explain what went wrong if the agent failed
+- Provide specific information from the agent's results
+- Don't give generic advice, focus on the actual data returned`,
                             lastAgentUsed: agentName,
-                            progress: finalProgress
+                            progress: finalProgress,
+                            agentResult: result // Pass the actual result data
                         });
                         
                         // Return the BaseAgent's structured response
@@ -378,9 +409,21 @@ class AgentManager {
                     };
                     
                     const finalResponse = await this.callAgent('BaseAgent', {
-                        userPrompt: `Please provide a comprehensive, well-structured response based on the successful results from ${agentName}. Extract and present the key information in a user-friendly format. Original user query: "${originalPrompt}"`,
+                        userPrompt: `Provide a comprehensive, well-structured response based on the successful results from ${agentName}. Present the extracted data in a user-friendly format.
+
+Original user query: "${originalPrompt}"
+
+Agent Results:
+${JSON.stringify(result, null, 2)}
+
+Instructions:
+- Present the extracted data clearly and organized
+- Format any product lists, data tables, or information nicely
+- Focus on the actual results and data found
+- Don't give generic advice, present the specific findings`,
                         lastAgentUsed: agentName,
-                        progress: finalProgress
+                        progress: finalProgress,
+                        agentResult: result // Pass the actual result data
                     });
                     
                     // Return the BaseAgent's structured response
@@ -437,7 +480,7 @@ class AgentManager {
             const executionTime = Date.now() - startTime;
             
             console.log(`[AgentManager] ${agentName} completed in ${executionTime}ms`);
-            
+            console.log(`[AgentManager] ${agentName} result:`, result);
             return {
                 ...result,
                 executionTime,
