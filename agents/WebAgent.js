@@ -575,7 +575,7 @@ Determine the next action. If you can extract the required data from the visible
       maxTokens: 1000,
       temperature: 0.1 // Lower temperature for more consistent responses
     });
-    
+    console.log('[WebAgent] LLM Response:', response);
     // Better JSON parsing with multiple strategies
     const parsedResponse = parseAIResponse(response);
     

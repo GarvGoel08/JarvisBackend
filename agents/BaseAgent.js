@@ -69,34 +69,28 @@ Current Context:
 - Progress: ${JSON.stringify(progress)}
 
 Response Rules:
-1. **FINAL FORMULATION MODE**: If finalFormulation is true, ALWAYS respond with {"isCompleted": true, "response": "comprehensive structured response"} - DO NOT route to other agents.
-The final response/result is given to the end user directly, dont give any responses that include internal instructions or context. Give a strucutred response that is easy to read for user.
+1. **ROUTING AND DECISION MODE**: Your primary job is routing to appropriate agents or providing quick direct answers to simple questions.
 
-2. If you can answer directly with current knowledge (factual, general knowledge, calculations, etc.), respond with:
+2. If you can answer directly with current knowledge (factual, general knowledge, calculations, etc.) AND the question is simple, respond with:
    {"isCompleted": true, "response": "your direct answer"}
 
-3. If you need to route to an agent, respond with:
+3. If you need to route to an agent for web data, complex analysis, or specialized tasks, respond with:
    {"isCompleted": false, "nextAgent": "AgentName", "params": {"param1": "value1"}, "reasoning": "why this agent is needed"}
 
 4. CRITICAL: Do NOT route to agents listed in Failed Agents. These have already been tried and failed.
 
-5. When formulating final responses or when you have sufficient information from previous agent attempts, provide comprehensive answers based on available information. Extract specific details like product names, prices, features, URLs, etc.
+5. **IMPORTANT**: When finalFormulation is true, it means other agents have completed their work and you're asked to provide a final response. However, the AgentManager will automatically route the result to ResponseFormatterAgent for proper formatting. In this case, just acknowledge completion:
+   {"isCompleted": true, "response": "Agent processing completed. Results will be formatted for display."}
 
-6. In final formulation mode, synthesize all available information into a well-structured, user-friendly response with:
-   - Clear headings and bullet points
-   - Specific data and numbers when available
-   - Actionable recommendations
-   - Proper formatting with markdown
+6. Be conservative about routing - only route when you truly need additional data or specialized processing.
 
-7. Be conservative about routing - only route when you truly need additional data. If previous agents gathered useful information, synthesize and present it.
+7. Consider the conversation flow and previous agents used to avoid loops.
 
-8. Consider the conversation flow and previous agents used to avoid loops.
+8. Only route to agents with status 'implemented' or no status field. Do not route to 'planned' agents.
 
-9. Only route to agents with status 'implemented' or no status field. Do not route to 'planned' agents.
+9. Ensure all required parameters are included in the params object.
 
-10. Ensure all required parameters are included in the params object.
-
-11. Format responses with clear structure, bullet points, and actionable information when possible.
+10. Focus on decision-making and routing rather than detailed response formatting - that's handled by specialized agents.
 
 12. In the final response, give a concise response, never explicitely state what the models were unable to do, instead just give the best possible response based on the information available.
 

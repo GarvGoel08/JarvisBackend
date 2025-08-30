@@ -1,5 +1,6 @@
 const { BaseAgent } = require('./BaseAgent');
 const { WebAgent } = require('./WebAgent');
+const { ResponseFormatterAgent } = require('./ResponseFormatterAgent');
 const { callLangChain } = require('../services/langchain');
 
 /**
@@ -27,6 +28,26 @@ const AVAILABLE_AGENTS = [
             'Fill out a form on a website',
             'Browse multiple pages to gather information',
             'Search for information on a website'
+        ]
+    },
+    {
+        name: 'ResponseFormatterAgent',
+        description: 'Formats raw agent results into clean, user-friendly responses',
+        requiredParams: ['userPrompt', 'agentResult', 'lastAgent'],
+        optionalParams: [],
+        capabilities: [
+            'Formats raw data into conversational responses',
+            'Removes tables and JSON from final output',
+            'Creates bullet-point lists for products/items',
+            'Includes clickable links and proper formatting',
+            'Handles pricing, ratings, and review formatting',
+            'Ensures responses are client-friendly'
+        ],
+        examples: [
+            'Format web scraping results for user display',
+            'Convert agent data to readable format',
+            'Clean up technical responses for end users',
+            'Structure product listings with proper formatting'
         ]
     },
     {
@@ -101,6 +122,7 @@ class AgentManager {
         // Register available agents
         this.registerAgent('BaseAgent', BaseAgent);
         this.registerAgent('WebAgent', WebAgent);
+        this.registerAgent('ResponseFormatterAgent', ResponseFormatterAgent);
         
         console.log(`[AgentManager] Initialized with ${this.agents.size} agents`);
     }
@@ -198,52 +220,30 @@ class AgentManager {
                 taskRecord.endTime = Date.now();
                 taskRecord.processingTime = Date.now() - startTime;
                 
-                // Always call BaseAgent at the end to formulate final structured response
+                // Always call ResponseFormatterAgent at the end to create user-friendly final response
                 if (routingResult && !routingResult.error && !routingResult.finallyFormulated) {
-                    console.log(`[AgentManager] Calling BaseAgent to formulate final response`);
+                    console.log(`[AgentManager] Calling ResponseFormatterAgent to create final user-friendly response`);
                     
-                    const finalProgress = {
-                        ...progress,
-                        lastAgent: currentResult.nextAgent,
-                        lastAgentResult: routingResult,
-                        step: (progress.step || 0) + 1,
-                        finalFormulation: true // Flag to indicate this is for final response formulation
-                    };
-
-                    console.log(`[AgentManager] ${currentResult.nextAgent} result:`, routingResult);
-                    
-                    const finalResponse = await this.callAgent('BaseAgent', {
-                        userPrompt: `Provide a comprehensive, well-structured response based on the WebAgent results below. Format and present the extracted data in a user-friendly way.
-                        
-Original user query: "${userPrompt}"
-
-WebAgent Results:
-${JSON.stringify(routingResult, null, 2)}
-
-Instructions:
-- If products were found, format them as a numbered list with names, prices, ratings, etc.
-- If no products were found, explain what happened and suggest alternatives
-- Be specific about the extracted data, don't give generic advice
-- Focus on presenting the actual results from WebAgent`,
-                        lastAgentUsed: currentResult.nextAgent,
-                        progress: finalProgress,
-                        webAgentResult: routingResult // Pass the actual result data
+                    const formatterResponse = await this.callAgent('ResponseFormatterAgent', {
+                        userPrompt: userPrompt,
+                        agentResult: routingResult,
+                        lastAgent: currentResult.nextAgent
                     });
                     
-                    // Use the BaseAgent's final formulated response as the result
-                    if (finalResponse && finalResponse.isCompleted && finalResponse.response) {
-                        taskRecord.finalFormulatedResponse = finalResponse;
-                        taskRecord.agentChain.push('BaseAgent (Final)');
+                    // Use the ResponseFormatterAgent's response as the final result
+                    if (formatterResponse && formatterResponse.isCompleted && formatterResponse.response) {
+                        taskRecord.finalFormattedResponse = formatterResponse;
+                        taskRecord.agentChain.push('ResponseFormatterAgent (Final)');
                         
-                        // Return the final formulated response instead of the raw routing result
+                        // Return the formatted response
                         const structuredResult = {
                             ...routingResult,
-                            result: finalResponse.response,
+                            result: formatterResponse.response,
                             isCompleted: true,
                             finallyFormulated: true,
                             originalAgentResult: routingResult,
-                            agent: 'BaseAgent',
-                            finalFormulationBy: 'BaseAgent',
+                            agent: 'ResponseFormatterAgent',
+                            finalFormattedBy: 'ResponseFormatterAgent',
                             timestamp: new Date().toISOString()
                         };
                         
@@ -251,8 +251,8 @@ Instructions:
                         return structuredResult;
                     }
                 } else if (routingResult && routingResult.finallyFormulated) {
-                    // Agent has already been processed through BaseAgent, return as-is
-                    console.log(`[AgentManager] ${currentResult.nextAgent} result already processed by BaseAgent, returning as-is`);
+                    // Agent result already formatted, return as-is
+                    console.log(`[AgentManager] ${currentResult.nextAgent} result already formatted, returning as-is`);
                     this.taskHistory.push(taskRecord);
                     return routingResult;
                 }
@@ -345,39 +345,21 @@ Instructions:
                     
                     // Check if the result indicates the agent should retry or if we should try a different approach
                     if (result.error || (result.result && result.result.status === 'partially_completed')) {
-                        // Agent failed or partially completed - call BaseAgent to formulate final response
-                        console.log(`[AgentManager] ${agentName} failed or partially completed, calling BaseAgent for final response`);
+                        // Agent failed or partially completed - call ResponseFormatterAgent for final response
+                        console.log(`[AgentManager] ${agentName} failed or partially completed, calling ResponseFormatterAgent for final response`);
                         
-                        const finalProgress = {
-                            ...updatedProgress,
-                            failedAgents: [...(progress.failedAgents || []), agentName],
-                            finalFormulation: true
-                        };
-                        
-                        const finalResponse = await this.callAgent('BaseAgent', {
-                            userPrompt: `Provide a comprehensive response based on the partial/failed results from ${agentName}. Present any useful information found.
-
-Original user query: "${originalPrompt}"
-
-Agent Results:
-${JSON.stringify(result, null, 2)}
-
-Instructions:
-- Extract and present any partial data that was found
-- Explain what went wrong if the agent failed
-- Provide specific information from the agent's results
-- Don't give generic advice, focus on the actual data returned`,
-                            lastAgentUsed: agentName,
-                            progress: finalProgress,
-                            agentResult: result // Pass the actual result data
+                        const formatterResponse = await this.callAgent('ResponseFormatterAgent', {
+                            userPrompt: originalPrompt,
+                            agentResult: result,
+                            lastAgent: agentName
                         });
                         
-                        // Return the BaseAgent's structured response
+                        // Return the ResponseFormatterAgent's structured response
                         return {
-                            ...finalResponse,
+                            ...formatterResponse,
                             originalAgentResult: result,
                             finallyFormulated: true,
-                            finalFormulationBy: 'BaseAgent',
+                            finalFormattedBy: 'ResponseFormatterAgent',
                             partialCompletion: true,
                             timestamp: new Date().toISOString()
                         };
@@ -399,42 +381,25 @@ Instructions:
                     }
                 }
                 
-                // Agent completed successfully - call BaseAgent to formulate final response
+                // Agent completed successfully - call ResponseFormatterAgent for final response
                 if (result.isCompleted && !result.finallyFormulated) {
-                    console.log(`[AgentManager] ${agentName} completed successfully, calling BaseAgent for final response formulation`);
+                    console.log(`[AgentManager] ${agentName} completed successfully, calling ResponseFormatterAgent for final response formatting`);
                     
-                    const finalProgress = {
-                        ...updatedProgress,
-                        finalFormulation: true
-                    };
-                    
-                    const finalResponse = await this.callAgent('BaseAgent', {
-                        userPrompt: `Provide a comprehensive, well-structured response based on the successful results from ${agentName}. Present the extracted data in a user-friendly format.
-
-Original user query: "${originalPrompt}"
-
-Agent Results:
-${JSON.stringify(result, null, 2)}
-
-Instructions:
-- Present the extracted data clearly and organized
-- Format any product lists, data tables, or information nicely
-- Focus on the actual results and data found
-- Don't give generic advice, present the specific findings`,
-                        lastAgentUsed: agentName,
-                        progress: finalProgress,
-                        agentResult: result // Pass the actual result data
+                    const formatterResponse = await this.callAgent('ResponseFormatterAgent', {
+                        userPrompt: originalPrompt,
+                        agentResult: result,
+                        lastAgent: agentName
                     });
                     
-                    // Return the BaseAgent's structured response
-                    if (finalResponse && finalResponse.isCompleted && finalResponse.response) {
+                    // Return the ResponseFormatterAgent's structured response
+                    if (formatterResponse && formatterResponse.isCompleted && formatterResponse.response) {
                         return {
                             ...result,
-                            result: finalResponse.response,
+                            result: formatterResponse.response,
                             isCompleted: true,
                             finallyFormulated: true,
                             originalAgentResult: result,
-                            finalFormulationBy: 'BaseAgent',
+                            finalFormattedBy: 'ResponseFormatterAgent',
                             timestamp: new Date().toISOString()
                         };
                     }
