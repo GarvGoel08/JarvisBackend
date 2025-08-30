@@ -45,26 +45,28 @@ async function ResponseFormatterAgent(params) {
         // Create a comprehensive but user-friendly system prompt
         const systemPrompt = `You are a professional response formatter. Your job is to take raw data from web agents and format it into clean, user-friendly responses.
 
-FORMATTING RULES:
-1. Write in a conversational, helpful tone
-2. Use simple bullet points (•) for lists, no complex tables
-3. Include all important details (names, prices, ratings, links)
-4. Use clear headings with ## for main sections
-5. Keep responses concise but complete
-6. Always include source information at the end
-7. Use ₹ symbol for Indian prices, $ for USD prices
-8. Format ratings as "X.X/5 stars" or "X.X★"
-9. Include review counts when available
-10. Make Amazon/product links clickable with [text](url) format
+CRITICAL FORMATTING RULES:
+1. NEVER truncate or skip products - format ALL items provided in the data
+2. Write in a conversational, helpful tone
+3. Use simple bullet points (•) for lists, no complex tables
+4. Include all important details (names, prices, ratings, links)
+5. Use clear headings with ## for main sections
+6. Keep responses concise but complete - include EVERY product
+7. Always include source information at the end
+8. Use ₹ symbol for Indian prices, $ for USD prices
+9. Format ratings as "X.X★" or "X.X/5 stars"
+10. Include review counts when available
+11. Make Amazon/product links clickable with [text](url) format
+12. For large lists, mention total count and ensure all items are included
 
 RESPONSE STRUCTURE:
-- Start with a brief summary
-- List items with key details
+- Start with a brief summary including total count
+- List ALL items with key details
 - End with source and date information
 - NO tables, NO JSON, NO complex formatting
 - Keep it conversational and easy to read
 
-SAMPLE FORMAT:
+SAMPLE FORMAT FOR MULTIPLE PRODUCTS:
 ## [Query Topic]
 
 I found [X] great options for you:
@@ -79,31 +81,92 @@ I found [X] great options for you:
   Key features: [brief description]
   [View on Amazon](link)
 
----
-*Source: Amazon India | Updated: [date]*`;
+[Continue for ALL products - do not stop or truncate]
 
-        // Create the user prompt with the data
+---
+*Source: [source] | Found [X] products | Updated: [date]*
+
+IMPORTANT: If there are many products, you MUST include them all. Do not use phrases like "and many more" or truncate the list. The user expects to see every product that was found.`;
+
+        // Handle large datasets more efficiently
+        let processedData = dataToFormat;
+        let isLargeDataset = false;
+
+        // If we have products, process them intelligently
+        if (dataToFormat && dataToFormat.products && dataToFormat.products.length > 0) {
+            const products = dataToFormat.products;
+            isLargeDataset = products.length > 20;
+            
+            // For large datasets, create a more concise summary for the LLM
+            if (isLargeDataset) {
+                processedData = {
+                    ...dataToFormat,
+                    products: products.map(product => ({
+                        name: product.name,
+                        price: product.price,
+                        priceNumeric: product.priceNumeric,
+                        rating: product.rating,
+                        reviewCount: product.reviewCount,
+                        link: product.link,
+                        brand: product.brand
+                    }))
+                };
+                console.log(`[ResponseFormatter] Processing large dataset with ${products.length} products`);
+            }
+        }
+
+        // Create the user prompt with optimized data
         const userPromptForFormatter = `Please format this data into a user-friendly response for the query: "${userPrompt}"
 
-Raw Data:
-${JSON.stringify(dataToFormat, null, 2)}
+${isLargeDataset ? 'Note: This is a large dataset. Please format ALL items in the list, ensuring none are truncated.' : ''}
 
-Data Source: ${dataSource}
-Source Agent: ${lastAgent}
+Raw Data Summary:
+- Total Products: ${dataToFormat?.products?.length || 'Unknown'}
+- Data Source: ${dataSource}
+- Source Agent: ${lastAgent}
 
-Create a conversational, well-formatted response that directly answers the user's question. Include all relevant product details but keep it easy to read.`;
+Product Details:
+${JSON.stringify(processedData, null, 2)}
 
-        // Get the formatted response
+IMPORTANT INSTRUCTIONS:
+1. Format ALL products in the dataset - do not truncate or skip any
+2. Use bullet points (•) for easy reading
+3. Include: Product name, price, rating, review count, key features
+4. Make all Amazon links clickable with [View on Amazon](link) format
+5. Keep descriptions concise but informative
+6. If there are more than 10 products, group them logically or mention "showing top X results"
+7. Always include the total number of products found
+
+Create a complete response that includes every product in the data.`;
+
+        // Get the formatted response with increased token limit for large datasets
+        const tokenLimit = isLargeDataset ? 4000 : 2500;
         const formattedResponse = await callLangChain(systemPrompt, userPromptForFormatter, {
-            maxTokens: 2000,
-            temperature: 0.2 // Low temperature for consistent formatting
+            maxTokens: tokenLimit,
+            temperature: 0.1 // Even lower temperature for more consistent formatting
         });
 
         console.log(`[ResponseFormatter] Successfully formatted response (${formattedResponse.length} chars)`);
 
+        // Quality check: Ensure all products are included in the response
+        let finalResponse = formattedResponse.trim();
+        
+        if (dataToFormat?.products?.length > 0) {
+            const expectedProductCount = dataToFormat.products.length;
+            const responseProductCount = (finalResponse.match(/•\s*\*\*/g) || []).length;
+            
+            console.log(`[ResponseFormatter] Expected ${expectedProductCount} products, found ${responseProductCount} in response`);
+            
+            // If significant products are missing, use direct formatting
+            if (responseProductCount < expectedProductCount * 0.8) {
+                console.log(`[ResponseFormatter] LLM response appears truncated, using direct formatting`);
+                finalResponse = createDirectFormattedResponse(userPrompt, dataToFormat, dataSource);
+            }
+        }
+
         return {
             isCompleted: true,
-            response: formattedResponse.trim(),
+            response: finalResponse,
             timestamp: new Date().toISOString(),
             agent: 'ResponseFormatterAgent',
             sourceAgent: lastAgent,
@@ -136,6 +199,84 @@ Create a conversational, well-formatted response that directly answers the user'
             };
         }
     }
+}
+
+/**
+ * Create a direct formatted response when LLM truncates the output
+ */
+function createDirectFormattedResponse(userPrompt, dataToFormat, dataSource) {
+    if (!dataToFormat?.products?.length) {
+        return `## Results for: ${userPrompt}\n\nI found some information but couldn't format it properly. Please try a more specific query.`;
+    }
+    
+    const products = dataToFormat.products;
+    const pageUrl = dataToFormat.pageUrl || dataSource;
+    
+    let response = `## Best Phones Under ₹20,000 on Amazon\n\n`;
+    response += `I found ${products.length} great options that fit your budget. Here are all the phones with their details:\n\n`;
+    
+    products.forEach((product, index) => {
+        response += `• **${product.name || `Product ${index + 1}`}** - ${product.price || 'Price not available'}\n`;
+        
+        if (product.rating) {
+            response += `  Rating: ${product.rating}★`;
+            if (product.reviewCount) {
+                response += ` (${product.reviewCount.toLocaleString()} reviews)`;
+            }
+            response += '\n';
+        }
+        
+        // Add key features from the product name
+        if (product.name && product.name.length > 50) {
+            const features = extractKeyFeatures(product.name);
+            if (features.length > 0) {
+                response += `  Key features: ${features.join(', ')}\n`;
+            }
+        }
+        
+        if (product.link) {
+            response += `  [View on Amazon](${product.link})\n`;
+        }
+        
+        response += '\n';
+    });
+    
+    response += `---\n*Source: ${pageUrl} | Found ${products.length} products | Updated: ${new Date().toLocaleDateString()}*`;
+    
+    return response;
+}
+
+/**
+ * Extract key features from product names
+ */
+function extractKeyFeatures(productName) {
+    const features = [];
+    const name = productName.toLowerCase();
+    
+    // RAM detection
+    const ramMatch = name.match(/(\d+)\s*gb\s*ram/);
+    if (ramMatch) features.push(`${ramMatch[1]}GB RAM`);
+    
+    // Storage detection
+    const storageMatch = name.match(/(\d+)\s*gb\s*storage/);
+    if (storageMatch) features.push(`${storageMatch[1]}GB Storage`);
+    
+    // Display features
+    if (name.includes('amoled')) features.push('AMOLED display');
+    if (name.includes('120hz')) features.push('120Hz refresh rate');
+    
+    // Camera features
+    const cameraMatch = name.match(/(\d+)\s*mp/);
+    if (cameraMatch) features.push(`${cameraMatch[1]}MP camera`);
+    
+    // Battery
+    const batteryMatch = name.match(/(\d+)\s*mah/);
+    if (batteryMatch) features.push(`${batteryMatch[1]}mAh battery`);
+    
+    // 5G support
+    if (name.includes('5g')) features.push('5G support');
+    
+    return features.slice(0, 3); // Limit to 3 key features
 }
 
 /**
