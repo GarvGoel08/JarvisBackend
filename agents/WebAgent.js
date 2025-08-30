@@ -110,15 +110,19 @@ async function WebAgent(params) {
         const actionResult = await executeAction(page, action);
         
         if (actionResult.success && actionResult.data) {
-          // If extraction was successful and returned meaningful data
-          if (actionResult.data.products && actionResult.data.products.length > 0) {
+          // Check if extraction returned meaningful data
+          const hasItems = (actionResult.data.items && actionResult.data.items.length > 0) ||
+                          (actionResult.data.products && actionResult.data.products.length > 0);
+          
+          if (hasItems) {
             taskCompleted = true;
+            const itemCount = actionResult.data.items?.length || actionResult.data.products?.length || 0;
             finalResult = {
               status: 'Completed',
               extractedData: actionResult.data,
-              summary: `Successfully extracted ${actionResult.data.products.length} products from ${actionResult.data.pageUrl}`
+              summary: `Successfully extracted ${itemCount} items from ${actionResult.data.pageUrl}`
             };
-            console.log(`[WebAgent] Data extraction completed with ${actionResult.data.products.length} items`);
+            console.log(`[WebAgent] Data extraction completed with ${itemCount} items`);
             break;
           } else {
             // Extraction returned no data, continue with more actions
@@ -174,16 +178,16 @@ async function WebAgent(params) {
       
       // Try one final extraction attempt before giving up
       try {
-        const finalExtractionResult = await extractDataFromPage(page, task);
+        const finalExtractionResult = await performIntelligentExtraction(page, 'body', task);
         
-        if (finalExtractionResult.products && finalExtractionResult.products.length > 0) {
+        if (finalExtractionResult.items && finalExtractionResult.items.length > 0) {
           taskCompleted = true;
           finalResult = {
             status: 'Completed via final extraction',
             extractedData: finalExtractionResult,
-            summary: `Extracted ${finalExtractionResult.products.length} products in final attempt`
+            summary: `Extracted ${finalExtractionResult.items.length} items in final attempt`
           };
-          console.log(`[WebAgent] Final extraction successful: ${finalExtractionResult.products.length} products found`);
+          console.log(`[WebAgent] Final extraction successful: ${finalExtractionResult.items.length} items found`);
         } else {
           finalResult = await generatePartialResult(task, allSteps);
           taskCompleted = false;
@@ -815,8 +819,10 @@ async function executeAction(page, action) {
         break;
         
       case 'extract':
-        // New extraction action type
-        const extractionResult = await extractDataFromPage(page, value || target);
+        // Unified extraction function that adapts to any website
+        console.log(`[WebAgent] Performing intelligent extraction on "${target}" with value:`, value);
+        const extractionResult = await performIntelligentExtraction(page, target, value);
+        
         return { 
           success: true, 
           message: 'Data extraction completed', 
@@ -845,317 +851,250 @@ async function executeAction(page, action) {
 }
 
 /**
- * Extract structured data from the current page
+ * Unified intelligent extraction function that adapts to any website structure
+ * Handles both structured field mappings and general data extraction
  */
-async function extractDataFromPage(page, query) {
+async function performIntelligentExtraction(page, containerSelector, extractionConfig) {
   try {
-    const extractedData = await page.evaluate((taskQuery) => {
-      // Enhanced data extraction based on common e-commerce patterns
-      const products = [];
+    const extractedData = await page.evaluate(({ containerSel, config }) => {
+      console.log('Starting intelligent extraction with config:', config);
       
-      // Common product container selectors (prioritized by reliability)
-      const productSelectors = [
-        // Amazon-specific selectors (most reliable)
-        'div[data-component-type="s-search-result"]',
-        '.s-result-item',
-        '.s-search-result',
-        
-        // Generic e-commerce selectors
-        '[data-component-type*="product"]',
-        '.product-item',
-        '.product-card',
-        '[data-testid*="product"]',
-        
-        // Fallback selectors
-        'div[class*="result-item"]',
-        'div[class*="product"]',
-        '.sg-col-inner'
-      ];
-      
-      let productContainers = [];
-      
-      // Find product containers using the most reliable selector first
-      for (const selector of productSelectors) {
-        try {
-          const elements = document.querySelectorAll(selector);
-          if (elements.length > 0) {
-            productContainers = Array.from(elements);
-            console.log(`Found ${elements.length} products using selector: ${selector}`);
-            break;
+      // Parse string-based field mappings (e.g., "title: .gs_rt; authors_year: .gs_a")
+      let parsedConfig = config;
+      if (typeof config === 'string' && config.includes(':')) {
+        parsedConfig = {};
+        const pairs = config.split(';').map(pair => pair.trim()).filter(pair => pair.length > 0);
+        pairs.forEach(pair => {
+          const [key, selector] = pair.split(':').map(s => s.trim());
+          if (key && selector) {
+            parsedConfig[key] = selector;
           }
-        } catch (e) {
-          console.warn(`Invalid selector: ${selector}`);
-        }
-      }
-      
-      // If no specific product containers, look for repeated patterns
-      if (productContainers.length === 0) {
-        const allDivs = document.querySelectorAll('div[class*="result"], div[class*="item"], div[class*="product"], div[class*="card"]');
-        productContainers = Array.from(allDivs).filter(div => {
-          const hasPrice = div.querySelector('[class*="price"], [class*="cost"], .a-price');
-          const hasTitle = div.querySelector('h1, h2, h3, h4, h5, a[href*="product"], a[title]');
-          return hasPrice || hasTitle;
         });
+        console.log('Parsed string config into object:', parsedConfig);
       }
       
-      // Extract data from each product container
-      productContainers.forEach((container, index) => {
-        if (index >= 15) return; // Limit to first 15 products
+      // Helper function to safely get text content
+      const getTextContent = (element) => {
+        if (!element) return '';
+        return element.textContent?.trim() || 
+               element.value?.trim() || 
+               element.getAttribute('alt')?.trim() || 
+               element.getAttribute('title')?.trim() || 
+               element.getAttribute('aria-label')?.trim() || '';
+      };
+      
+      // Helper function to safely get attribute
+      const getAttribute = (element, attr) => {
+        return element?.getAttribute(attr)?.trim() || '';
+      };
+      
+      // Helper function to find elements using multiple selectors
+      const findElementBySelectors = (container, selectors) => {
+        if (typeof selectors === 'string') {
+          selectors = [selectors];
+        }
         
-        const product = {
-          index: index + 1,
-          container: container.className || ''
+        for (const selector of selectors) {
+          try {
+            const element = container.querySelector(selector);
+            if (element) return element;
+          } catch (e) {
+            console.warn(`Invalid selector: ${selector}`);
+          }
+        }
+        return null;
+      };
+      
+      // Step 1: Find container elements
+      let containers = [];
+      
+      try {
+        containers = Array.from(document.querySelectorAll(containerSel));
+        console.log(`Found ${containers.length} containers using selector: ${containerSel}`);
+      } catch (e) {
+        console.warn(`Invalid container selector: ${containerSel}`);
+        containers = [document.body]; // Fallback to body
+      }
+      
+      if (containers.length === 0) {
+        containers = [document.body]; // Fallback to body
+      }
+      
+      const results = [];
+      
+      // Step 2: Process each container
+      containers.forEach((container, containerIndex) => {
+        const item = {
+          index: containerIndex + 1,
+          containerSelector: containerSel
         };
         
-        // Extract title/name - Amazon specific selectors first
-        const titleSelectors = [
-          // Amazon-specific title selectors
-          'h2.a-size-mini a.a-link-normal',
-          'h2 a.a-link-normal span',
-          '.a-size-base-plus',
-          '.a-size-medium.a-color-base',
+        // Step 3: Handle different extraction configurations
+        if (typeof parsedConfig === 'object' && parsedConfig !== null && !Array.isArray(parsedConfig)) {
+          // Structured field extraction (e.g., {title: "h3", url: "a", snippet: "p"})
+          console.log('Using structured field extraction');
           
-          // Generic selectors
-          'h1 a, h2 a, h3 a, h4 a, h5 a',
-          '[data-cy="product-title"] a',
-          'a[href*="dp/"]',  // Amazon product pages
-          'a[href*="product"]',
-          '.s-link-style a',
-          'a[title]',
-          'h1, h2, h3, h4, h5',
-          '.product-title',
-          '[class*="title"]'
-        ];
-        
-        for (const selector of titleSelectors) {
-          try {
-            const titleElement = container.querySelector(selector);
-            if (titleElement) {
-              let name = titleElement.textContent?.trim() || titleElement.title?.trim() || titleElement.getAttribute('aria-label')?.trim() || '';
-              let link = titleElement.href || '';
-              
-              // If it's a span inside a link, get the parent link
-              if (!link && titleElement.parentElement && titleElement.parentElement.href) {
-                link = titleElement.parentElement.href;
-              }
-              
-              if (name && name.length > 5) { // Ensure meaningful name
-                product.name = name;
-                product.link = link;
-                break;
-              }
-            }
-          } catch (e) {
-            console.warn(`Selector failed: ${selector}`, e.message);
-          }
-        }
-        
-        // Extract brand (often in title or separate element)
-        const brandSelectors = [
-          '[class*="brand"]',
-          '.brand',
-          'span[dir="auto"]:first-child'
-        ];
-        
-        for (const selector of brandSelectors) {
-          const brandElement = container.querySelector(selector);
-          if (brandElement) {
-            product.brand = brandElement.textContent?.trim() || '';
-            if (product.brand) break;
-          }
-        }
-        
-        // Extract from title if brand not found separately
-        if (!product.brand && product.name) {
-          const commonBrands = ['Samsung', 'iPhone', 'OnePlus', 'Xiaomi', 'Realme', 'Oppo', 'Vivo', 'Apple', 'Google', 'Nothing'];
-          const foundBrand = commonBrands.find(brand => 
-            product.name.toLowerCase().includes(brand.toLowerCase())
-          );
-          if (foundBrand) product.brand = foundBrand;
-        }
-        
-        // Extract price - Amazon specific selectors
-        const priceSelectors = [
-          // Amazon price structure
-          '.a-price .a-offscreen',  // Hidden but complete price
-          '.a-price-whole',         // Whole number part
-          '.a-price-range .a-offscreen', // Price range
-          
-          // Alternative Amazon price selectors
-          '.a-price',
-          '.a-price-current',
-          
-          // Generic price selectors
-          '[class*="price-current"]',
-          '[class*="price-now"]',
-          '[class*="price"]',
-          '.price',
-          '[data-testid*="price"]'
-        ];
-        
-        for (const selector of priceSelectors) {
-          try {
-            const priceElement = container.querySelector(selector);
-            if (priceElement) {
-              let priceText = priceElement.textContent?.trim() || '';
-              
-              // Handle Amazon's price structure (whole + fraction)
-              if (selector === '.a-price-whole') {
-                const fractionElement = container.querySelector('.a-price-fraction');
-                if (fractionElement) {
-                  priceText += '.' + fractionElement.textContent?.trim();
+          Object.entries(parsedConfig).forEach(([fieldName, fieldSelectors]) => {
+            const element = findElementBySelectors(container, fieldSelectors);
+            
+            if (element) {
+              // For links, get href; for images, get src; for others, get text
+              if (element.tagName.toLowerCase() === 'a') {
+                item[fieldName] = element.href || getTextContent(element);
+                if (fieldName === 'url' || fieldName === 'link' || fieldName === 'href') {
+                  item[`${fieldName}_text`] = getTextContent(element);
                 }
+              } else if (element.tagName.toLowerCase() === 'img') {
+                item[fieldName] = element.src || getAttribute(element, 'data-src');
+                item[`${fieldName}_alt`] = getAttribute(element, 'alt');
+              } else {
+                item[fieldName] = getTextContent(element);
               }
-              
-              // Extract numeric price
-              const priceMatch = priceText.match(/[\d,]+(?:\.[\d]{2})?/);
-              if (priceMatch) {
-                product.price = priceText;
-                product.priceNumeric = parseFloat(priceMatch[0].replace(/,/g, ''));
-                break;
-              }
-            }
-          } catch (e) {
-            console.warn(`Price selector failed: ${selector}`, e.message);
-          }
-        }
-        
-        // Extract rating - Amazon specific
-        const ratingSelectors = [
-          // Amazon rating selectors
-          '.a-icon-alt',
-          '.a-star-alt',
-          'span[aria-label*="out of 5 stars"]',
-          'span[aria-label*="star"]',
-          
-          // Generic rating selectors
-          '[class*="rating"]',
-          '.rating',
-          '[aria-label*="rating"]',
-          '[data-testid*="rating"]'
-        ];
-        
-        for (const selector of ratingSelectors) {
-          try {
-            const ratingElement = container.querySelector(selector);
-            if (ratingElement) {
-              const ratingText = ratingElement.textContent || ratingElement.getAttribute('aria-label') || ratingElement.title || '';
-              const ratingMatch = ratingText.match(/([\d.]+)\s*(?:out\s*of\s*5|stars?|\/5)?/i);
-              if (ratingMatch) {
-                product.rating = parseFloat(ratingMatch[1]);
-                break;
-              }
-            }
-          } catch (e) {
-            console.warn(`Rating selector failed: ${selector}`, e.message);
-          }
-        }
-        
-        // Extract review count - Amazon specific
-        const reviewSelectors = [
-          // Amazon review count selectors
-          'a[href*="#customerReviews"]',
-          '.a-link-normal[href*="reviews"]',
-          'span[aria-label*="review"]',
-          
-          // Generic review selectors
-          'a[href*="reviews"]',
-          '[class*="review"]',
-          '.review-count',
-          '[data-testid*="review"]'
-        ];
-        
-        for (const selector of reviewSelectors) {
-          try {
-            const reviewElement = container.querySelector(selector);
-            if (reviewElement) {
-              const reviewText = reviewElement.textContent || reviewElement.getAttribute('aria-label') || '';
-              const reviewMatch = reviewText.match(/([\d,]+)\s*(?:reviews?|ratings?)?/i);
-              if (reviewMatch) {
-                product.reviewCount = parseInt(reviewMatch[1].replace(/,/g, ''));
-                break;
-              }
-            }
-          } catch (e) {
-            console.warn(`Review selector failed: ${selector}`, e.message);
-          }
-        }
-        
-        // Extract offers/discounts
-        const offerSelectors = [
-          '[class*="deal"]',
-          '[class*="offer"]',
-          '[class*="discount"]',
-          '.coupon',
-          '[class*="save"]'
-        ];
-        
-        const offers = [];
-        offerSelectors.forEach(selector => {
-          const offerElements = container.querySelectorAll(selector);
-          offerElements.forEach(el => {
-            const offerText = el.textContent?.trim();
-            if (offerText && offerText.length > 0 && offerText.length < 100) {
-              offers.push(offerText);
             }
           });
-        });
-        
-        if (offers.length > 0) {
-          product.offers = offers.slice(0, 3); // Limit to 3 offers
+          
+        } else {
+          // Smart auto-detection extraction
+          console.log('Using smart auto-detection extraction');
+          
+          // Common patterns for different types of content
+          const patterns = {
+            // Titles/headings
+            title: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '[class*="title"]', '[class*="heading"]', '[data-testid*="title"]'],
+            
+            // Links
+            link: ['a[href]', '[class*="link"]'],
+            
+            // Descriptions/snippets
+            description: ['p', '.description', '[class*="description"]', '[class*="snippet"]', '[class*="summary"]'],
+            
+            // Prices
+            price: ['[class*="price"]', '[data-testid*="price"]', '[class*="cost"]', '[class*="amount"]'],
+            
+            // Ratings
+            rating: ['[class*="rating"]', '[class*="star"]', '[aria-label*="star"]', '[aria-label*="rating"]'],
+            
+            // Images
+            image: ['img', '[class*="image"]', '[class*="photo"]', '[class*="picture"]'],
+            
+            // Dates
+            date: ['[class*="date"]', '[class*="time"]', 'time', '[datetime]'],
+            
+            // Authors/sources
+            author: ['[class*="author"]', '[class*="user"]', '[class*="name"]', '[class*="source"]']
+          };
+          
+          // Apply patterns to find content
+          Object.entries(patterns).forEach(([fieldName, selectors]) => {
+            const element = findElementBySelectors(container, selectors);
+            
+            if (element) {
+              const text = getTextContent(element);
+              if (text && text.length > 0) {
+                if (element.tagName.toLowerCase() === 'a' && element.href) {
+                  item[fieldName] = text;
+                  item[`${fieldName}_url`] = element.href;
+                } else if (element.tagName.toLowerCase() === 'img') {
+                  item[fieldName] = element.src || getAttribute(element, 'data-src');
+                  item[`${fieldName}_alt`] = getAttribute(element, 'alt');
+                } else {
+                  item[fieldName] = text;
+                }
+              }
+            }
+          });
+          
+          // Special extraction for numeric values (prices, ratings, counts)
+          const allText = getTextContent(container);
+          
+          // Extract prices (₹, $, €, etc.)
+          const priceMatch = allText.match(/[₹$€£¥₩]\s*[\d,]+(?:\.[\d]{1,2})?|\d+[,.]?\d*\s*[₹$€£¥₩]/);
+          if (priceMatch && !item.price) {
+            item.price = priceMatch[0].trim();
+            const numericMatch = priceMatch[0].match(/[\d,]+(?:\.[\d]{1,2})?/);
+            if (numericMatch) {
+              item.price_numeric = parseFloat(numericMatch[0].replace(/,/g, ''));
+            }
+          }
+          
+          // Extract ratings (X.X/5, X.X stars, X.X★)
+          const ratingMatch = allText.match(/(\d+\.?\d*)\s*(?:\/\s*5|stars?|★|out\s+of\s+5)/i);
+          if (ratingMatch && !item.rating) {
+            item.rating = parseFloat(ratingMatch[1]);
+          }
+          
+          // Extract counts (review counts, view counts, etc.)
+          const countMatch = allText.match(/(\d+[,\d]*)\s*(?:reviews?|ratings?|views?|likes?|comments?)/i);
+          if (countMatch) {
+            const countType = countMatch[0].toLowerCase().includes('review') ? 'review_count' : 'count';
+            item[countType] = parseInt(countMatch[1].replace(/,/g, ''));
+          }
         }
         
-        // Only add products with essential information and validation
-        if (product.name && product.name.length > 5) {
-          // Additional validation for phone products
-          const nameText = product.name.toLowerCase();
-          const isPhoneProduct = nameText.includes('phone') || 
-                                nameText.includes('mobile') || 
-                                nameText.includes('smartphone') ||
-                                nameText.includes('iphone') ||
-                                nameText.includes('samsung') ||
-                                nameText.includes('oneplus') ||
-                                nameText.includes('xiaomi') ||
-                                nameText.includes('realme') ||
-                                nameText.includes('oppo') ||
-                                nameText.includes('vivo');
-          
-          // For phone search, prefer items that are actually phones
-          if (taskQuery && taskQuery.toLowerCase().includes('phone')) {
-            if (isPhoneProduct || product.price) {
-              products.push(product);
-            }
-          } else {
-            // For non-phone searches, add all products with names
-            products.push(product);
-          }
+        // Step 4: Quality check - only include items with meaningful content
+        const hasContent = Object.values(item).some(value => 
+          typeof value === 'string' && value.length > 2 ||
+          typeof value === 'number' && value > 0
+        );
+        
+        if (hasContent && Object.keys(item).length > 2) { // More than just index and containerSelector
+          results.push(item);
         }
       });
       
-      const extractionResult = {
-        products,
-        totalFound: productContainers.length,
-        totalExtracted: products.length,
+      // Step 5: Return structured result
+      const result = {
+        items: results,
+        totalFound: containers.length,
+        totalExtracted: results.length,
         pageUrl: window.location.href,
+        pageTitle: document.title,
         extractionTime: new Date().toISOString(),
-        query: taskQuery,
-        selectorsUsed: productSelectors.slice(0, 1) // First working selector
+        extractionType: typeof parsedConfig === 'object' && parsedConfig !== null ? 'structured' : 'auto-detection',
+        containerSelector: containerSel
       };
       
-      console.log(`Extraction complete: ${products.length}/${productContainers.length} products extracted`);
+      console.log(`Intelligent extraction complete: ${results.length}/${containers.length} items extracted`);
       
-      return extractionResult;
+      return result;
       
-    }, query);
+    }, { containerSel: containerSelector, config: extractionConfig });
     
-    return extractedData;
+    // Post-process the results
+    if (extractedData.items && extractedData.items.length > 0) {
+      console.log(`[WebAgent] Successfully extracted ${extractedData.items.length} items`);
+      
+      // For backward compatibility with existing code that expects 'products'
+      if (extractionConfig && typeof extractionConfig === 'string' && 
+          (extractionConfig.toLowerCase().includes('product') || 
+           extractionConfig.toLowerCase().includes('phone') ||
+           extractionConfig.toLowerCase().includes('shop'))) {
+        extractedData.products = extractedData.items;
+      }
+      
+      return extractedData;
+    } else {
+      console.log('[WebAgent] No items extracted');
+      return {
+        items: [],
+        products: [], // For backward compatibility
+        totalFound: 0,
+        totalExtracted: 0,
+        pageUrl: await page.url(),
+        error: 'No items could be extracted with the given selector and configuration'
+      };
+    }
     
   } catch (error) {
-    console.error(`[WebAgent] Data extraction failed: ${error.message}`);
+    console.error(`[WebAgent] Intelligent extraction failed: ${error.message}`);
     return {
       error: error.message,
-      products: [],
-      totalFound: 0
+      items: [],
+      products: [], // For backward compatibility
+      totalFound: 0,
+      totalExtracted: 0,
+      pageUrl: await page.url(),
+      extractionTime: new Date().toISOString()
     };
   }
 }
@@ -1165,20 +1104,28 @@ async function extractDataFromPage(page, query) {
  */
 async function generatePartialResult(task, allSteps) {
   // Check if any steps contained partial data
-  const extractionSteps = allSteps.filter(step => 
-    step.result?.data && step.result.data.products && step.result.data.products.length > 0
-  );
+  const extractionSteps = allSteps.filter(step => {
+    const data = step.result?.data;
+    return data && (
+      (data.items && data.items.length > 0) || 
+      (data.products && data.products.length > 0)
+    );
+  });
   
   if (extractionSteps.length > 0) {
     // Return the best extraction attempt
     const bestExtraction = extractionSteps.reduce((best, current) => {
-      return (current.result.data.products.length > best.result.data.products.length) ? current : best;
+      const currentCount = current.result.data.items?.length || current.result.data.products?.length || 0;
+      const bestCount = best.result.data.items?.length || best.result.data.products?.length || 0;
+      return currentCount > bestCount ? current : best;
     });
+    
+    const itemCount = bestExtraction.result.data.items?.length || bestExtraction.result.data.products?.length || 0;
     
     return {
       status: 'Partially Complete',
       extractedData: bestExtraction.result.data,
-      summary: `Partial success: Found ${bestExtraction.result.data.products.length} products. Task could not be fully completed within the iteration limit.`,
+      summary: `Partial success: Found ${itemCount} items. Task could not be fully completed within the iteration limit.`,
       steps: allSteps.length,
       completedIterations: allSteps.length
     };
